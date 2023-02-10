@@ -1,6 +1,7 @@
 # TODO
 Replace `primitive-types` crate with our own implementation
 Make Generator Lazy static
+Make the Prime P a Lazy static
 Publish the crate
 
 # IDEAS

@@ -32,6 +32,7 @@ pub trait PointElement:
     fn as_i64(&self) -> i64;
     fn is_zero(&self) -> bool;
     fn is_one(&self) -> bool;
+    fn sqrt(&self) -> Self;
 }
 
 impl PointElement for i64 {
@@ -51,6 +52,9 @@ impl PointElement for i64 {
     }
     fn is_one(&self) -> bool {
         *self == 1i64
+    }
+    fn sqrt(&self) -> Self {
+        *self
     }
 }
 
@@ -77,6 +81,9 @@ impl PointElement for FieldElement<i64> {
     fn is_one(&self) -> bool {
         self.value == 1i64
     }
+    fn sqrt(&self) -> Self {
+        *self
+    }
 }
 
 impl PointElement for FieldElement<U256> {
@@ -101,6 +108,10 @@ impl PointElement for FieldElement<U256> {
     }
     fn is_one(&self) -> bool {
         self.value == U256::zero()
+    }
+
+    fn sqrt(&self) -> Self  {
+        self.pow((self.order + U256::from(1)) / U256::from(4)).unwrap()
     }
 }
 
@@ -331,6 +342,97 @@ impl Secp256K1Point {
         Self::new(secp256k1_generator_x, secp256k1_generator_y)
     }
 
+    // Parses and extracts a new `Secp256K1Point` from a SEC format
+    pub fn parse(sec_bytes: &[u8]) -> Result<Self, Secp256K1PointError> {
+        let seckp256k1_prime: U256 = U256::from_str_radix(
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+            16
+        )?;
+        // First we read the marker from the data
+        let marker = sec_bytes.get(0).ok_or(Secp256K1PointError::DataTooShort)?;
+
+        // Afterwards we read the x-coordinate
+        let x = U256::from_big_endian(
+            sec_bytes.get(1..33).ok_or(Secp256K1PointError::DataTooShort)?,
+        );
+
+        let x = FieldElement::new(x, seckp256k1_prime)?;
+
+        // We obtain the y-coordinate in different ways, depending on the marker
+        match marker {
+            0x04 => {
+                // This branch means the format is not compressed and the y-coordinate just follows
+                // x
+                let y = U256::from_big_endian(
+                    sec_bytes.get(33..65).ok_or(Secp256K1PointError::DataTooShort)?,
+                );
+                // Return the parsed point
+                Self::new(x.value, y)
+            }
+            0x02 | 0x03 => {
+                // We compute the right side of the equation y^2 = x^3 + 7
+                let right_side = x.pow(U256::from(3))? + FieldElement::new(U256::from(7), seckp256k1_prime)?;
+                // We try and solve the left side
+                let left_side = right_side.sqrt();
+
+                let y_odd;
+                let y_even;
+
+                // Check if the y-coordinate is even
+                if left_side.value % U256::from(2) == U256::zero() {
+                    y_even = left_side;
+                    y_odd =
+                        FieldElement::<U256>::new(seckp256k1_prime - left_side.value, seckp256k1_prime)?;
+                } else {
+                    y_odd = left_side;
+                    y_even =
+                        FieldElement::<U256>::new(seckp256k1_prime - left_side.value, seckp256k1_prime)?;
+                }
+
+                match marker {
+                    0x02 => return Self::new(x.value, y_even.value),
+                    0x03 => return Self::new(x.value, y_odd.value),
+                    _ => return Err(Secp256K1PointError::UnknownMarker(*marker)),
+                }
+            }
+            _ => Err(Secp256K1PointError::UnknownMarker(*marker)),
+        }
+    }
+
+    // Returns the `point` in an uncompressed SEC format
+    pub fn sec(&self, compressed: bool) -> Result<Vec<u8>, Secp256K1PointError> {
+        let mut sec;
+
+        // Convert the x-coordinate of the point to big endian bytes
+        let x = self.point.x.ok_or(Secp256K1PointError::CompressingNone)?.value;
+        // Convert the y-coordinate of the point to big endian bytes
+        let y = self.point.y.ok_or(Secp256K1PointError::CompressingNone)?.value;
+
+        // Check if we want the compressed format
+        if compressed == false {
+            sec = [0; 65].to_vec();
+            // First byte is the identifier for the sec uncompressed format
+            sec[0] = 4;
+            x.to_big_endian(&mut sec[1..33]);
+            y.to_big_endian(&mut sec[33..65]);
+        } else {
+            sec = [0; 33].to_vec();
+
+            if y % U256::from(2) == U256::zero() {
+                // If y-coordinate is even, the marker is 0x02
+                sec[0] = 0x02;
+            } else {
+                // If y-coordinate is odd, the marker is 0x03
+                sec[0] = 0x03;
+            }
+
+            x.to_big_endian(&mut sec[1..33]);
+        }
+
+        // Return the result
+        Ok(sec)
+    }
+
     // Verifies that the signature hash `z` corresponds with the given `signature`
     pub fn verify(&self, z: U256, signature: Signature) -> Result<bool, Secp256K1PointError> {
         // Fetch the generator point for hte Bitcoin curve
@@ -519,6 +621,9 @@ pub enum Secp256K1PointError {
     FieldElementError(FieldElementError),
     PointErrorFieldElementU256(PointError<FieldElement<U256>>),
     DifferentGroupOrders(U256, U256),
+    UnknownMarker(u8),
+    CompressingNone,
+    DataTooShort,
 }
 
 impl From<uint::FromStrRadixErr> for Secp256K1PointError {
@@ -814,8 +919,9 @@ mod tests {
         let priv_key = PrivateKey::new(secret).expect("Bad Private Key");
         let message = double_sha256(b"Alan Turing");
 
-        println!("Is correct? {}",
-            priv_key.point.verify(message, priv_key.sign(message).unwrap()).unwrap()
+        assert_eq!(
+            true,
+            priv_key.point.verify(message, priv_key.sign(message).unwrap()).unwrap(),
         );
     }
 
@@ -881,5 +987,35 @@ mod tests {
         ).unwrap();
         assert_eq!(px_from_str, point.x.unwrap().value);
         assert_eq!(py_from_str, point.y.unwrap().value);
+    }
+
+    #[test]
+    fn test_uncompressed_sec() {
+        let sec_pairs = [
+            (U256::from(5000), "testdata/ex1_5000"),
+            (U256::from(2018_u128.pow(5)), "testdata/ex1_2018_pow_5"),
+            (U256::from_str_radix("deadbeef12345", 16).unwrap(), "testdata/ex1_deadbeef12345"),
+        ];
+
+        for (secret, filename) in sec_pairs {
+            let private_key = PrivateKey::new(secret).expect("Cannot make private key");
+            let sec_form = std::fs::read(filename).unwrap();
+            assert_eq!(private_key.point.sec(false).unwrap().as_slice(), sec_form.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_compressed_sec() {
+        let sec_pairs = [
+            (U256::from(5001), "testdata/ex2_5001"),
+            (U256::from(2019_u128.pow(5)), "testdata/ex2_2019_pow_5"),
+            (U256::from_str_radix("deadbeef54321", 16).unwrap(), "testdata/ex2_deadbeef54321"),
+        ];
+
+        for (secret, filename) in sec_pairs {
+            let private_key = PrivateKey::new(secret).expect("Cannot make private key");
+            let sec_form = std::fs::read(filename).unwrap();
+            assert_eq!(private_key.point.sec(true).unwrap().as_slice(), sec_form.as_slice());
+        }
     }
 }
