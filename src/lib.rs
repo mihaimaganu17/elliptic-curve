@@ -1,10 +1,9 @@
-use core::ops::{ Add, Sub, Mul, Div };
 use core::fmt::Debug;
-use finite_field::{FieldElement, FieldElementError, Element};
-use primitive_types::U256;
-use sha2::{Sha256, Digest};
-use rand::{thread_rng, Rng};
+use core::ops::{Add, Div, Mul, Sub};
+use finite_field::{Element, FieldElement, FieldElementError};
 use hmac::{Hmac, Mac};
+use primitive_types::U256;
+use sha2::{Digest, Sha256};
 
 /// Represents a point on an elliptic curve.
 /// We could make the curse a generic parameter?
@@ -17,10 +16,10 @@ struct Point<P: PointElement> {
 }
 
 pub trait PointElement:
-    Add<Output=Self>
-    + Sub<Output=Self>
-    + Mul<Output=Self>
-    + Div<Output=Self>
+    Add<Output = Self>
+    + Sub<Output = Self>
+    + Mul<Output = Self>
+    + Div<Output = Self>
     + Sized
     + PartialEq
     + Clone
@@ -110,19 +109,15 @@ impl PointElement for FieldElement<U256> {
         self.value == U256::zero()
     }
 
-    fn sqrt(&self) -> Self  {
-        self.pow((self.order + U256::from(1)) / U256::from(4)).unwrap()
+    fn sqrt(&self) -> Self {
+        self.pow((self.order + U256::from(1)) / U256::from(4))
+            .unwrap()
     }
 }
 
 impl<P: PointElement> Point<P> {
     /// Created a new `Point`
-    pub fn new(
-        a: P,
-        b: P,
-        x: Option<P>,
-        y: Option<P>
-    ) -> Result<Self, PointError<P>> {
+    pub fn new(a: P, b: P, x: Option<P>, y: Option<P>) -> Result<Self, PointError<P>> {
         // This represents that the point is the identity point and we just return it, without
         // checking it's presence on the curve
         if x.is_none() && y.is_none() {
@@ -157,7 +152,9 @@ impl<P: PointElement> Add for Point<P> {
     fn add(self, other: Self) -> Self::Output {
         // Check if the 2 points are on the same curve
         if self.a != other.a || self.b != other.b {
-            return Err(PointError::DifferentCurves(self.a, self.b, other.a, other.b));
+            return Err(PointError::DifferentCurves(
+                self.a, self.b, other.a, other.b,
+            ));
         }
 
         // If `self` is point at infinity, we return the `other` element
@@ -168,7 +165,6 @@ impl<P: PointElement> Add for Point<P> {
         if other.x.is_none() && other.y.is_none() {
             return Ok(self);
         }
-
 
         // At this point, we know that no value is `None` and it is safe to unwrap
         let x1 = self.x.unwrap();
@@ -263,7 +259,10 @@ impl Add for Secp256K1Point {
 
     fn add(self, other: Self) -> Self::Output {
         if self.order != other.order {
-            return Err(Secp256K1PointError::DifferentGroupOrders(self.order, other.order));
+            return Err(Secp256K1PointError::DifferentGroupOrders(
+                self.order,
+                other.order,
+            ));
         }
 
         Ok(Self {
@@ -278,7 +277,10 @@ impl Mul<U256> for Secp256K1Point {
 
     fn mul(self, other: U256) -> Self::Output {
         let other = other % self.order;
-        Ok(Self { point: (self.point * other)?, order: self.order })
+        Ok(Self {
+            point: (self.point * other)?,
+            order: self.order,
+        })
     }
 }
 
@@ -346,14 +348,16 @@ impl Secp256K1Point {
     pub fn parse(sec_bytes: &[u8]) -> Result<Self, Secp256K1PointError> {
         let seckp256k1_prime: U256 = U256::from_str_radix(
             "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
-            16
+            16,
         )?;
         // First we read the marker from the data
         let marker = sec_bytes.get(0).ok_or(Secp256K1PointError::DataTooShort)?;
 
         // Afterwards we read the x-coordinate
         let x = U256::from_big_endian(
-            sec_bytes.get(1..33).ok_or(Secp256K1PointError::DataTooShort)?,
+            sec_bytes
+                .get(1..33)
+                .ok_or(Secp256K1PointError::DataTooShort)?,
         );
 
         let x = FieldElement::new(x, seckp256k1_prime)?;
@@ -364,31 +368,44 @@ impl Secp256K1Point {
                 // This branch means the format is not compressed and the y-coordinate just follows
                 // x
                 let y = U256::from_big_endian(
-                    sec_bytes.get(33..65).ok_or(Secp256K1PointError::DataTooShort)?,
+                    sec_bytes
+                        .get(33..65)
+                        .ok_or(Secp256K1PointError::DataTooShort)?,
                 );
                 // Return the parsed point
                 Self::new(x.value, y)
             }
             0x02 | 0x03 => {
                 // We compute the right side of the equation y^2 = x^3 + 7
-                let right_side = x.pow(U256::from(3))? + FieldElement::new(U256::from(7), seckp256k1_prime)?;
+                let right_side =
+                    x.pow(U256::from(3))? + FieldElement::new(U256::from(7), seckp256k1_prime)?;
                 // We try and solve the left side
                 let left_side = right_side.sqrt();
 
                 let y_odd;
                 let y_even;
 
-                // Check if the y-coordinate is even
+                // Check if the y-coordinate is even. The equation we are computing has 2 possible
+                // solutions, one is `y` and one is `p-y`.
+                // Between the 2 values, since `p` is prime and odd and `y` can be both odd or even
+                // there will always be 1 odd value and 1 even value for the solutions.
+                // This `if` statement computes them both
                 if left_side.value % U256::from(2) == U256::zero() {
                     y_even = left_side;
-                    y_odd =
-                        FieldElement::<U256>::new(seckp256k1_prime - left_side.value, seckp256k1_prime)?;
+                    y_odd = FieldElement::<U256>::new(
+                        seckp256k1_prime - left_side.value,
+                        seckp256k1_prime,
+                    )?;
                 } else {
                     y_odd = left_side;
-                    y_even =
-                        FieldElement::<U256>::new(seckp256k1_prime - left_side.value, seckp256k1_prime)?;
+                    y_even = FieldElement::<U256>::new(
+                        seckp256k1_prime - left_side.value,
+                        seckp256k1_prime,
+                    )?;
                 }
 
+                // Depending on what the marker says about the evenness of the value, we
+                // instantiate with the correct `y`
                 match marker {
                     0x02 => return Self::new(x.value, y_even.value),
                     0x03 => return Self::new(x.value, y_odd.value),
@@ -399,21 +416,32 @@ impl Secp256K1Point {
         }
     }
 
-    // Returns the `point` in an uncompressed SEC format
+    // Returns the `point` representing a ECDSA Public Key in an uncompressed or compressed SEC
+    // format. This serializes the point in a Big Endian format.
     pub fn sec(&self, compressed: bool) -> Result<Vec<u8>, Secp256K1PointError> {
         let mut sec;
 
-        // Convert the x-coordinate of the point to big endian bytes
-        let x = self.point.x.ok_or(Secp256K1PointError::CompressingNone)?.value;
-        // Convert the y-coordinate of the point to big endian bytes
-        let y = self.point.y.ok_or(Secp256K1PointError::CompressingNone)?.value;
+        // Get the value of the x-coordinate
+        let x = self
+            .point
+            .x
+            .ok_or(Secp256K1PointError::CompressingNone)?
+            .value;
+        // Get the value of the y-coordinate
+        let y = self
+            .point
+            .y
+            .ok_or(Secp256K1PointError::CompressingNone)?
+            .value;
 
         // Check if we want the compressed format
         if compressed == false {
             sec = [0; 65].to_vec();
             // First byte is the identifier for the sec uncompressed format
             sec[0] = 4;
+            // Serialzie the x-coordinate as Big Endian
             x.to_big_endian(&mut sec[1..33]);
+            // Serialzie the y-coordinate as Big Endian
             y.to_big_endian(&mut sec[33..65]);
         } else {
             sec = [0; 33].to_vec();
@@ -439,20 +467,24 @@ impl Secp256K1Point {
         let generator = Secp256K1Point::generator()?;
 
         // Compute `s` to the power of `-1`, which in elliptic curve language is power of `N-2`
-        let s_inv = pow_mod(signature.s, self.order-U256::from(2u8), self.order);
+        let s_inv = pow_mod(signature.s, self.order - U256::from(2u8), self.order);
 
         // Compute `u` which is the scalar for the generator point G
         let u = z.mul_mod(s_inv, self.order);
         // Compute `v` which is the scalar for the Public key P
         let v = signature.r.mul_mod(s_inv, self.order);
         // Compute the left side of the sum
-        let left = (generator*u)?;
+        let left = (generator * u)?;
         // Compute the right side of the sum
-        let right = (*self*v)?;
+        let right = (*self * v)?;
         // Check if the target that we supplied earlier, represented by `r` is the the same we
         // obtained from the equation computed above
-        let verified = (left + right)?.point.x
-            .ok_or(PointError::InvalidCoordinate)?.value == signature.r;
+        let verified = (left + right)?
+            .point
+            .x
+            .ok_or(PointError::InvalidCoordinate)?
+            .value
+            == signature.r;
 
         // Return the result
         Ok(verified)
@@ -464,7 +496,7 @@ impl Secp256K1Point {
         // 2**256 - 2**32 - 997
         let seckp256k1_prime: U256 = U256::from_str_radix(
             "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
-            16
+            16,
         )?;
 
         // Instantiate all elements as Finite fields
@@ -474,12 +506,7 @@ impl Secp256K1Point {
         let fe_b = FieldElement::<U256>::new(U256::from_str_radix("7", 10)?, seckp256k1_prime)?;
 
         // Instatiate the generator point
-        let point = Point::new(
-            fe_a,
-            fe_b,
-            Some(fe_x),
-            Some(fe_y),
-        )?;
+        let generator_point = Point::new(fe_a, fe_b, Some(fe_x), Some(fe_y))?;
 
         // Order of the Finite Field generated by the Generator Point above. Also represents the
         // scalar at which we find the point at inifinity
@@ -489,7 +516,7 @@ impl Secp256K1Point {
         )?;
 
         Ok(Self {
-            point,
+            point: generator_point,
             order: seckp256k1_order,
         })
     }
@@ -532,33 +559,42 @@ impl PrivateKey {
     pub fn sign(&self, z: U256) -> Result<Signature, PrivateKeyError> {
         let k = self.deterministic_k(z);
         // Compute the x-coordinate of R, which is k*G
-        let r = (self.generator * k)?.point.x.ok_or(PrivateKeyError::InvalidX)?.value;
+        let r = (self.generator * k)?
+            .point
+            .x
+            .ok_or(PrivateKeyError::InvalidX)?
+            .value;
 
         // Compute the inverse of k
-        let k_inv = pow_mod(k, self.generator.order - U256::from(2u8), self.generator.order);
+        let k_inv = pow_mod(
+            k,
+            self.generator.order - U256::from(2u8),
+            self.generator.order,
+        );
         // Compute s=(z+r*e)/k
-        let s = (z + r.mul_mod(self.secret, self.generator.order))
-            .mul_mod(k_inv, self.generator.order);
+        let s =
+            (z + r.mul_mod(self.secret, self.generator.order)).mul_mod(k_inv, self.generator.order);
 
         // Return the signature
         Ok(Signature::new(r, s))
     }
 
     fn deterministic_k(&self, z: U256) -> U256 {
+        // Sequence of bytes filled with zero
         let k = [0; 32];
+        // Sequence of bytes filled with one
         let v = [1; 32];
-
-        let mut local_z = z;
 
         let order = self.point.order;
 
-        if local_z > order {
-            local_z = local_z - order;
-        }
-
         // --------------------------- Part 1 --------------------------------
-        let mut hmac_msg_slice: Vec<u8> = Vec::with_capacity(32 * 4 + 1);
-        hmac_msg_slice.resize(32 * 4 + 1, 0);
+        // Create a new `Vec` that can store (v, 0x00, secret, z) where
+        // v, secret and z are all 256-bit or 32-byte unsigned integers
+        let mut hmac_msg_slice: Vec<u8> = Vec::with_capacity(32 * 3 + 1);
+        // Since the `Vec` is only instantiated, the len is currently 0. So resizing it as we do
+        // below will only fill the structure with zeros
+        hmac_msg_slice.resize(32 * 3 + 1, 0);
+
         hmac_msg_slice.get_mut(0..32).unwrap().copy_from_slice(&v);
         hmac_msg_slice[32] = 0;
         self.secret.to_big_endian(&mut hmac_msg_slice[33..65]);
@@ -566,7 +602,6 @@ impl PrivateKey {
 
         let mut k_hash = compute_hmac_sha256(&k, &hmac_msg_slice);
         let mut v_hash = compute_hmac_sha256(&k_hash, &v);
-
 
         // --------------------------- Part 2 --------------------------------
         hmac_msg_slice.fill(0);
@@ -600,8 +635,6 @@ impl PrivateKey {
         candidate
     }
 }
-
-use generic_array::GenericArray;
 
 fn compute_hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     // Instantiate a new MAC (message authentication code) with the given `key` over `sha256`
@@ -644,7 +677,7 @@ impl From<PointError<FieldElement<U256>>> for Secp256K1PointError {
     }
 }
 
-/// Compute the sha 256 hash value twice for the `bytes`
+/// Compute the sha 256 hash value twice for the `bytes` and return it as a `U256` Big Endian
 pub fn double_sha256(bytes: &[u8]) -> U256 {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -656,15 +689,13 @@ pub fn double_sha256(bytes: &[u8]) -> U256 {
 
     let result = hasher.finalize();
 
-    U256::from_big_endian(
-        result.as_slice()
-    )
+    U256::from_big_endian(result.as_slice())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PrivateKey, Point, Secp256K1Point, U256, Signature};
     use super::double_sha256;
+    use super::{Point, PrivateKey, Secp256K1Point, Signature, U256};
     use finite_field::FieldElement;
 
     #[test]
@@ -688,8 +719,8 @@ mod tests {
         let pairs = [(2, 4), (-1, -1), (18, 77), (5, 7)];
         let not_on_curve = [(2, 4), (5, 7)];
 
-        for (x,y) in pairs {
-            if not_on_curve.contains(&(x,y)) {
+        for (x, y) in pairs {
+            if not_on_curve.contains(&(x, y)) {
                 assert_eq!(false, Point::new(a, b, Some(x), Some(y)).is_ok());
             } else {
                 assert_eq!(true, Point::new(a, b, Some(x), Some(y)).is_ok());
@@ -704,8 +735,14 @@ mod tests {
         let p2 = Point::new(5, 7, Some(-1), Some(1)).unwrap();
 
         let infinity = Point::new(5, 7, None, None).unwrap();
-        assert_eq!((p1 + infinity).unwrap(), Point::new(5, 7, Some(-1), Some(-1)).unwrap());
-        assert_eq!((p2 + infinity).unwrap(), Point::new(5, 7, Some(-1), Some(1)).unwrap());
+        assert_eq!(
+            (p1 + infinity).unwrap(),
+            Point::new(5, 7, Some(-1), Some(-1)).unwrap()
+        );
+        assert_eq!(
+            (p2 + infinity).unwrap(),
+            Point::new(5, 7, Some(-1), Some(1)).unwrap()
+        );
         assert_eq!((p1 + p2).unwrap(), Point::new(5, 7, None, None).unwrap());
     }
 
@@ -760,7 +797,7 @@ mod tests {
             ((192, 105), (17, 56), (170, 142)),
             ((170, 142), (60, 139), (220, 181)),
             ((47, 71), (17, 56), (215, 68)),
-            ((143, 98), (76, 66), (47, 71))
+            ((143, 98), (76, 66), (47, 71)),
         ];
 
         for ((x1, y1), (x2, y2), (x3, y3)) in point_pairs {
@@ -790,12 +827,31 @@ mod tests {
 
         let p1 = Point::new(a, b, Some(x1), Some(y1)).unwrap();
 
-        let finite_group_pairs = [(47, 71), (36, 111), (15, 137), (194, 51), (126, 96), (139, 137),
-            (92, 47), (116, 55), (69, 86), (154, 150), (154, 73), (69, 137), (116, 168), (92, 176),
-            (139, 86), (126, 127), (194, 172), (15, 86), (36, 112), (47, 152)];
+        let finite_group_pairs = [
+            (47, 71),
+            (36, 111),
+            (15, 137),
+            (194, 51),
+            (126, 96),
+            (139, 137),
+            (92, 47),
+            (116, 55),
+            (69, 86),
+            (154, 150),
+            (154, 73),
+            (69, 137),
+            (116, 168),
+            (92, 176),
+            (139, 86),
+            (126, 127),
+            (194, 172),
+            (15, 86),
+            (36, 112),
+            (47, 152),
+        ];
 
         for s in 1..21 {
-            let (x,y) = finite_group_pairs.get(s-1).unwrap();
+            let (x, y) = finite_group_pairs.get(s - 1).unwrap();
 
             let x3 = FieldElement::<i64>::new(*x, 223).unwrap();
             let y3 = FieldElement::<i64>::new(*y, 223).unwrap();
@@ -823,7 +879,7 @@ mod tests {
         let x2 = FieldElement::<i64>::new(47, 223).unwrap();
         let y2 = FieldElement::<i64>::new(71, 223).unwrap();
         let y_zero = FieldElement::<i64>::new(0, 223).unwrap();
-        let p_to_sub = Point::new(a, b, Some(x2), Some(y_zero-y2)).unwrap();
+        let p_to_sub = Point::new(a, b, Some(x2), Some(y_zero - y2)).unwrap();
 
         let a = FieldElement::<i64>::new(0, 223).unwrap();
         let b = FieldElement::<i64>::new(7, 223).unwrap();
@@ -843,33 +899,53 @@ mod tests {
         assert_eq!(17, times);
     }
 
+    // Essentially this test if for making sure that the generator is on the curve
     #[test]
     fn test_seckp256k1field_new() {
         Secp256K1Point::generator().unwrap();
+    }
+
+    // Verify whether the generator point, G, has the order n
+    #[test]
+    fn test_seckp256k1_generator_has_order_n() {
+        let generator_point = Secp256K1Point::generator().expect("Failed to get generator");
+        /// N represents the order of the group
+        let N: U256 = U256::from_str_radix(
+            "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+            16,
+        )
+        .unwrap();
+        // X and Y of this point should be `None`
+        let point_at_infinity = (generator_point * N).expect("Failed to multiply");
     }
 
     #[test]
     fn test_verify_signature() {
         let z = U256::from_str_radix(
             "bc62d4b80d9e36da29c16c5d4d9f11731f36052c72401a76c23c0fb5a9b74423",
-            16
-        ).unwrap();
+            16,
+        )
+        .unwrap();
         let r = U256::from_str_radix(
             "37206a0610995c58074999cb9767b87af4c4978db68c06e8e6e81d282047a7c6",
             16,
-        ).unwrap();
+        )
+        .unwrap();
         let s = U256::from_str_radix(
             "8ca63759c1157ebeaec0d03cecca119fc9a75bf8e6d0fa65c841c8e2738cdaec",
             16,
-        ).unwrap();
+        )
+        .unwrap();
         let px = U256::from_str_radix(
             "04519fac3d910ca7e7138f7013706f619fa8f033e6ec6e09370ea38cee6a7574",
             16,
-        ).unwrap();
+        )
+        .unwrap();
         let py = U256::from_str_radix(
             "82b51eab8c27c66e26c858a079bcdf4f1ada34cec420cafc7eac1a42216fb6c4",
             16,
-        ).unwrap();
+        )
+        .unwrap();
 
         let point = Secp256K1Point::new(px, py).unwrap();
 
@@ -881,11 +957,13 @@ mod tests {
         let px = U256::from_str_radix(
             "887387e452b8eacc4acfde10d9aaf7f6d9a0f975aabb10d006e4da568744d06c",
             16,
-        ).unwrap();
+        )
+        .unwrap();
         let py = U256::from_str_radix(
             "61de6d95231cd89026e286df3b6ae4a894a3378e393e93a0f45b666329a0ae34",
             16,
-        ).unwrap();
+        )
+        .unwrap();
         let point = Secp256K1Point::new(px, py).unwrap();
 
         let pairs = [
@@ -915,19 +993,22 @@ mod tests {
         let secret = U256::from_str_radix(
             "f8b8af8ce3c7cca5e300d33939540c10d45ce001b8f252bfbc57ba0342904181",
             16,
-        ).unwrap();
+        )
+        .unwrap();
         let priv_key = PrivateKey::new(secret).expect("Bad Private Key");
         let message = double_sha256(b"Alan Turing");
 
         assert_eq!(
             true,
-            priv_key.point.verify(message, priv_key.sign(message).unwrap()).unwrap(),
+            priv_key
+                .point
+                .verify(message, priv_key.sign(message).unwrap())
+                .unwrap(),
         );
     }
 
     #[test]
-    fn test_sha256() {
-
+    fn test_create_signature() {
         // This is an example of a brain wallet. This is a way to keep the private key, or rather
         // the stem or seed of the private key in your head without having to memorize something
         // too difficult.
@@ -940,7 +1021,8 @@ mod tests {
         let z_from_str = U256::from_str_radix(
             "231c6f3d980a6b0fb7152f85cee7eb52bf92433d9919b9c5218cb08e79cce78",
             16,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(z, z_from_str);
 
@@ -955,7 +1037,8 @@ mod tests {
         let r_from_str = U256::from_str_radix(
             "2b698a0f0a4041b77e63488ad48c23e8e8838dd1fb7520408b121697b782ef22",
             16,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(r_from_str, r);
 
         // Compute s=(z+r*e)/k
@@ -965,11 +1048,11 @@ mod tests {
 
         let s = (z + r.mul_mod(e, generator.order)).mul_mod(k_inv, generator.order);
         let s_from_str = U256::from_str_radix(
-           "bb14e602ef9e3f872e25fad328466b34e6734b7a0fcd58b1eb635447ffae8cb9",
+            "bb14e602ef9e3f872e25fad328466b34e6734b7a0fcd58b1eb635447ffae8cb9",
             16,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(s_from_str, s);
-
 
         let point = (generator * e).unwrap();
 
@@ -980,11 +1063,13 @@ mod tests {
         let px_from_str = U256::from_str_radix(
             "028d003eab2e428d11983f3e97c3fa0addf3b42740df0d211795ffb3be2f6c52",
             16,
-        ).unwrap();
+        )
+        .unwrap();
         let py_from_str = U256::from_str_radix(
             "0ae987b9ec6ea159c78cb2a937ed89096fb218d9e7594f02b547526d8cd309e2",
             16,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(px_from_str, point.x.unwrap().value);
         assert_eq!(py_from_str, point.y.unwrap().value);
     }
@@ -994,13 +1079,20 @@ mod tests {
         let sec_pairs = [
             (U256::from(5000), "testdata/ex1_5000"),
             (U256::from(2018_u128.pow(5)), "testdata/ex1_2018_pow_5"),
-            (U256::from_str_radix("deadbeef12345", 16).unwrap(), "testdata/ex1_deadbeef12345"),
+            (
+                U256::from_str_radix("deadbeef12345", 16).unwrap(),
+                "testdata/ex1_deadbeef12345",
+            ),
         ];
 
         for (secret, filename) in sec_pairs {
             let private_key = PrivateKey::new(secret).expect("Cannot make private key");
+            println!("{:x?}", private_key.point.sec(false).unwrap().as_slice());
             let sec_form = std::fs::read(filename).unwrap();
-            assert_eq!(private_key.point.sec(false).unwrap().as_slice(), sec_form.as_slice());
+            assert_eq!(
+                private_key.point.sec(false).unwrap().as_slice(),
+                sec_form.as_slice()
+            );
         }
     }
 
@@ -1009,13 +1101,19 @@ mod tests {
         let sec_pairs = [
             (U256::from(5001), "testdata/ex2_5001"),
             (U256::from(2019_u128.pow(5)), "testdata/ex2_2019_pow_5"),
-            (U256::from_str_radix("deadbeef54321", 16).unwrap(), "testdata/ex2_deadbeef54321"),
+            (
+                U256::from_str_radix("deadbeef54321", 16).unwrap(),
+                "testdata/ex2_deadbeef54321",
+            ),
         ];
 
         for (secret, filename) in sec_pairs {
             let private_key = PrivateKey::new(secret).expect("Cannot make private key");
             let sec_form = std::fs::read(filename).unwrap();
-            assert_eq!(private_key.point.sec(true).unwrap().as_slice(), sec_form.as_slice());
+            assert_eq!(
+                private_key.point.sec(true).unwrap().as_slice(),
+                sec_form.as_slice()
+            );
         }
     }
 }

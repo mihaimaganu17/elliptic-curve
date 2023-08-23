@@ -2,3 +2,4 @@
 Cargo.lock
 rusty-tags.vi
 **/*.swp
+.tags
