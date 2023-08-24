@@ -314,10 +314,91 @@ pub struct Signature {
     s: U256,
 }
 
+// Maximum DER encoding length, which is comprised of:
+// - 1 byte for 0x30 Marker
+// - 1 byte for length of the encoded signature (usually 0x44 or 0x45)
+// - 1 byte for the marker of `r` value (0x02)
+// - 1 byte for the `r` value length
+// - at most 33 bytes (includin 0x00 prepended byte for `r`), can be less since this value
+// has all the prepending zeros (except for the marker one) removed
+// - 1 byte for the marker of `s` value (0x02)
+// - 1 byte for the `s` value length
+// - at most 33 bytes (includin 0x00 prepended byte for `s`), can be less since this value
+// has all the prepending zeros (except for the marker one) removed
+const DER_MAX_LEN: usize = 4 * 1 + 33 + 2 * 1 + 33;
+
+// Marker for the DER encoding, similar to a format magic
+const DER_ENCODING_MARKER: u8 = 0x30;
+
+// Marker for a value inside the DER encoding
+const DER_VALUE_MARKER: u8 = 0x02;
+
+// Takes a `U256` and encodes it as a DER format value
+fn encode_der_value(value: U256) -> Result<Vec<u8>, EncodingError> {
+    // Instatiate an `array` we can use as buffer to store `value`'s bytes
+    let mut value_buffer = [0; 32];
+    // Convert `value` into bytes and write them to the buffer
+    value.to_big_endian(&mut value_buffer);
+    // Strip all leading zeros
+    let mut value_bytes = value_buffer.into_iter().skip_while(|&x| x == 0).collect::<Vec<u8>>();
+
+    // Allocate a new `Vec` to hold the encoding of the `value`
+    // - We need space for 2 Markers, each 1 byte in size
+    // - And at most 33 bytes including the prepended `0x00` byte
+    let mut value_encoding = Vec::with_capacity(2 + 33);
+
+    // Push the `Marker` for the `value`
+    value_encoding.push(DER_VALUE_MARKER);
+    // Check if `value` has the high bit set
+    if *value_bytes.get(0).ok_or(EncodingError::ZeroLengthValue)? & 0x80 != 0 {
+        // If it has the high bit set, we prepend it with a zero byte
+        value_bytes.insert(0, 0u8);
+    }
+    // Now we push the lenght of `value`. Since we know that the length can be at most 33, it is
+    // safe to cast it as an `u8`
+    value_encoding.push(value_bytes.len() as u8);
+    // And finaly we add the bytes of `value`
+    value_encoding.extend(value_bytes);
+
+    Ok(value_encoding)
+}
+
 impl Signature {
+    /// Creates a new `Signature` given an `r` and an `s`
     pub fn new(r: U256, s: U256) -> Self {
         Self { r, s }
     }
+
+    /// Encodes the signature in a DER(Distinguished Encoding Rules) format
+    pub fn der(self) -> Result<Vec<u8>, EncodingError> {
+        // Instantiate a new `Vec` which will hold the DER encoding
+        let mut der_encoding = Vec::with_capacity(DER_MAX_LEN);
+        // Add the marker for the DER encoding
+        der_encoding.push(DER_ENCODING_MARKER);
+
+        // Encode the value for `r`
+        let r_encoding = encode_der_value(self.r)?;
+        // Encode the value for `s`
+        let s_encoding = encode_der_value(self.s)?;
+
+        // Compute the size for the rest of the encoding, excluding the marker
+        let remaining_enc_size = r_encoding.len() + s_encoding.len();
+        // Push the rest of the encoding size
+        der_encoding.push(remaining_enc_size as u8);
+
+        // Add the encoding for `r`
+        der_encoding.extend(r_encoding);
+        // Add the encoding for `s`
+        der_encoding.extend(s_encoding);
+
+        Ok(der_encoding)
+    }
+}
+
+/// Issues an error whenever encoding goes wrong
+#[derive(Debug)]
+pub enum EncodingError {
+    ZeroLengthValue,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -629,7 +710,6 @@ impl PrivateKey {
 
             k_hash = compute_hmac_sha256(&k_hash, &msg_slice);
             v_hash = compute_hmac_sha256(&k_hash, &v_hash);
-            println!("We arrived here");
         }
 
         candidate
@@ -1087,7 +1167,6 @@ mod tests {
 
         for (secret, filename) in sec_pairs {
             let private_key = PrivateKey::new(secret).expect("Cannot make private key");
-            println!("{:x?}", private_key.point.sec(false).unwrap().as_slice());
             let sec_form = std::fs::read(filename).unwrap();
             assert_eq!(
                 private_key.point.sec(false).unwrap().as_slice(),
@@ -1115,5 +1194,45 @@ mod tests {
                 sec_form.as_slice()
             );
         }
+    }
+
+    #[test]
+    fn test_signature() {
+        let r = U256::from_str_radix(
+            "0000000000000000000000000000000000000000000000000000001abcdef",
+            16,
+        ).unwrap();
+        let s = U256::from_str_radix(
+            "0000000000000000000000000000000000000000000000000000000abcdef",
+            16,
+        ).unwrap();
+
+        let sig = Signature::new(r, s);
+        sig.der().unwrap();
+    }
+
+    #[test]
+    fn test_der_ex3() {
+        let r = U256::from_str_radix(
+            "37206a0610995c58074999cb9767b87af4c4978db68c06e8e6e81d282047a7c6",
+            16,
+        ).unwrap();
+        let s = U256::from_str_radix(
+            "8ca63759c1157ebeaec0d03cecca119fc9a75bf8e6d0fa65c841c8e2738cdaec",
+            16,
+        ).unwrap();
+
+        let sig = Signature::new(r, s);
+        // Encode our signature with the DER format
+        let der_encoding = sig.der().unwrap();
+
+        // Read the result from the test file
+        let der_enc_result = std::fs::read("testdata/ex3_der_encoded_sig.bin").unwrap();
+
+        // Test if the 2 are equal
+        assert_eq!(
+            der_encoding,
+            der_enc_result,
+        );
     }
 }
