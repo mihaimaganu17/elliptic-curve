@@ -335,11 +335,11 @@ const DER_VALUE_MARKER: u8 = 0x02;
 
 // Takes a `U256` and encodes it as a DER format value
 fn encode_der_value(value: U256) -> Result<Vec<u8>, EncodingError> {
-    // Instatiate an `array` we can use as buffer to store `value`'s bytes
+    // instatiate an `array` we can use as buffer to store `value`'s bytes
     let mut value_buffer = [0; 32];
-    // Convert `value` into bytes and write them to the buffer
+    // convert `value` into bytes and write them to the buffer
     value.to_big_endian(&mut value_buffer);
-    // Strip all leading zeros
+    // strip all leading zeros
     let mut value_bytes = value_buffer.into_iter().skip_while(|&x| x == 0).collect::<Vec<u8>>();
 
     // Allocate a new `Vec` to hold the encoding of the `value`
@@ -362,6 +362,50 @@ fn encode_der_value(value: U256) -> Result<Vec<u8>, EncodingError> {
 
     Ok(value_encoding)
 }
+
+// The Base58 alfhabet is made up of all the alpha-numerical characters, except for the following
+// pairs:
+// - 0(zero) and O (bit o)
+// - l(lowercase L) and I(uppercase i)
+const _BASE58_ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+// Take a `U256` value and convert it to Base58
+fn _encode_base58(value: U256) -> Result<String, EncodingError> {
+    // We copy the value to make it mutable
+    let mut value = value;
+    // instatiate an `array` we can use as buffer to store `value`'s bytes
+    let mut value_buffer = [0; 32];
+    // convert `value` into bytes and write them to the buffer
+    value.to_big_endian(&mut value_buffer);
+    // Count all the leading zeros
+    let leading_zeros = value_buffer.into_iter().take_while(|&x| x == 0).count();
+
+    // Costruct a prefix of `1` (ones) which is the Base58 character for zero
+    let prefix = std::iter::repeat('1').take(leading_zeros).collect::<String>();
+
+    // Instantiate an empty string to store th result
+    let mut encoding = String::from("");
+
+    // While our value is not zero
+    while value > U256::zero() {
+        // Compute the remainder of the operation
+        let remainder: usize = (value % _BASE58_ALPHABET.len()).as_usize();
+        // Get the mapped value from the Base58 alphabet. Since we cannot inter string slices
+        // because they are made up of UTF-8 characters, we need to do this
+        let base58_char = _BASE58_ALPHABET.chars().nth(remainder).ok_or(EncodingError::OutOfRange)?;
+        // Insert it to the beginning of the string
+        encoding.insert(0, base58_char);
+        // Reduce the initial value
+        value = value / _BASE58_ALPHABET.len();
+    }
+
+    // We also insert the prefix and return the value
+    encoding.insert_str(0, &prefix);
+
+    // Return the resulting encoding
+    Ok(encoding)
+}
+
 
 impl Signature {
     /// Creates a new `Signature` given an `r` and an `s`
@@ -399,6 +443,7 @@ impl Signature {
 #[derive(Debug)]
 pub enum EncodingError {
     ZeroLengthValue,
+    OutOfRange,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -694,12 +739,10 @@ impl PrivateKey {
         k_hash = compute_hmac_sha256(&k_hash, &hmac_msg_slice);
         v_hash = compute_hmac_sha256(&k_hash, &v_hash);
 
-        let mut candidate = U256::zero();
-
-        while true {
+        loop {
             v_hash = compute_hmac_sha256(&k_hash, &v_hash);
 
-            candidate = U256::from_big_endian(&v_hash);
+            let candidate = U256::from_big_endian(&v_hash);
             if candidate >= U256::one() && candidate < order {
                 return candidate;
             }
@@ -711,8 +754,6 @@ impl PrivateKey {
             k_hash = compute_hmac_sha256(&k_hash, &msg_slice);
             v_hash = compute_hmac_sha256(&k_hash, &v_hash);
         }
-
-        candidate
     }
 }
 
@@ -989,14 +1030,14 @@ mod tests {
     #[test]
     fn test_seckp256k1_generator_has_order_n() {
         let generator_point = Secp256K1Point::generator().expect("Failed to get generator");
-        /// N represents the order of the group
-        let N: U256 = U256::from_str_radix(
+        // N represents the order of the group
+        let n: U256 = U256::from_str_radix(
             "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
             16,
         )
         .unwrap();
         // X and Y of this point should be `None`
-        let point_at_infinity = (generator_point * N).expect("Failed to multiply");
+        let _point_at_infinity = (generator_point * n).expect("Failed to multiply");
     }
 
     #[test]
@@ -1234,5 +1275,31 @@ mod tests {
             der_encoding,
             der_enc_result,
         );
+    }
+
+    #[test]
+    fn test_base58_ex4() {
+        let values = [
+            (
+                "7c076ff316692a3d7eb3c3bb0f8b1488cf72e1afcd929e29307032997a838a3d",
+                "testdata/base58_ex4_1.txt",
+            ),
+            (
+                "eff69ef2b1bd93a66ed5219add4fb51e11a840f404876325a1e8ffe0529a2c",
+                "testdata/base58_ex4_2.txt",
+            ),
+            (
+                "c7207fee197d27c618aea621406f6bf5ef6fca38681d82b2f06fddbdce6feab6",
+                "testdata/base58_ex4_3.txt",
+            ),
+        ];
+
+        for (hex_value, file_path) in values.iter() {
+            let value = U256::from_str_radix(hex_value, 16).unwrap();
+            let base58_encoding = crate::_encode_base58(value).unwrap();
+            let mut correct_value = std::fs::read_to_string(file_path).unwrap();
+            correct_value.pop();
+            assert_eq!(base58_encoding, correct_value);
+        }
     }
 }
