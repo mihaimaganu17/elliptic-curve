@@ -1,4 +1,6 @@
 use primitive_types::U256;
+use uint::FromStrRadixErr;
+use crate::hashing::double_sha256;
 
 // Maximum DER encoding length, which is comprised of:
 // - 1 byte for 0x30 Marker
@@ -59,15 +61,9 @@ pub fn encode_der_value(value: U256) -> Result<Vec<u8>, EncodingError> {
 const _BASE58_ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 // Take a `U256` value and convert it to Base58
-pub fn _encode_base58(value: U256) -> Result<String, EncodingError> {
-    // We copy the value to make it mutable
-    let mut value = value;
-    // instatiate an `array` we can use as buffer to store `value`'s bytes
-    let mut value_buffer = [0; 32];
-    // convert `value` into bytes and write them to the buffer
-    value.to_big_endian(&mut value_buffer);
+pub fn _encode_base58(buffer: &[u8]) -> Result<String, EncodingError> {
     // Count all the leading zeros
-    let leading_zeros = value_buffer.into_iter().take_while(|&x| x == 0).count();
+    let leading_zeros = buffer.iter().take_while(|&x| *x == 0).count();
 
     // Costruct a prefix of `1` (ones) which is the Base58 character for zero
     let prefix = std::iter::repeat('1')
@@ -76,6 +72,9 @@ pub fn _encode_base58(value: U256) -> Result<String, EncodingError> {
 
     // Instantiate an empty string to store th result
     let mut encoding = String::from("");
+
+    // Encode the given value in an U256 value
+    let mut value = U256::from_big_endian(buffer);
 
     // While our value is not zero
     while value > U256::zero() {
@@ -100,9 +99,36 @@ pub fn _encode_base58(value: U256) -> Result<String, EncodingError> {
     Ok(encoding)
 }
 
+pub fn encode_base58_checksum(buffer: &[u8]) -> Result<String, EncodingError> {
+    // Compute the double `Sha256` for the given buffer
+    let double_sha256 = double_sha256(buffer);
+
+    // We need to concatenate the first 4 bytes of the double sha256 result with the buffer. So we
+    // convert it to a `String` in order to do that
+    let mut buffer = buffer.to_vec();
+
+    // Take the first 4 bytes from the double sha256 result
+    for idx in 0..4 {
+        // Convert each byte into a `char`
+        let new_byte = double_sha256[idx];
+        // Push the `char` in the buffer
+        buffer.push(new_byte);
+    }
+
+    _encode_base58(&buffer)
+}
+
 /// Issues an error whenever encoding goes wrong
 #[derive(Debug)]
 pub enum EncodingError {
     ZeroLengthValue,
     OutOfRange,
+    FromStrRadixErr(FromStrRadixErr),
 }
+
+impl From<FromStrRadixErr> for EncodingError {
+    fn from(err: FromStrRadixErr) -> Self {
+        Self::FromStrRadixErr(err)
+    }
+}
+

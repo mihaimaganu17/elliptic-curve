@@ -2,11 +2,13 @@ pub mod curve;
 pub mod hashing;
 pub mod serialise;
 pub mod sign;
+pub mod utils;
 
 #[cfg(test)]
 mod tests {
     use crate::curve::{Point, Secp256K1Point};
     use crate::hashing::double_sha256;
+    use crate::utils;
     use crate::sign::{PrivateKey, Signature};
     use finite_field::FieldElement;
     use primitive_types::U256;
@@ -309,7 +311,7 @@ mod tests {
         )
         .unwrap();
         let priv_key = PrivateKey::new(secret).expect("Bad Private Key");
-        let message = double_sha256(b"Alan Turing");
+        let message = U256::from_big_endian(&double_sha256(b"Alan Turing"));
 
         assert_eq!(
             true,
@@ -326,9 +328,9 @@ mod tests {
         // the stem or seed of the private key in your head without having to memorize something
         // too difficult.
         // TO NOT BE USED as a REAL SECRET.
-        let e = double_sha256(b"my secret");
+        let e = U256::from_big_endian(&double_sha256(b"my secret"));
         // This is the signature hash, or the hash of the message that we are signing.
-        let z = double_sha256(b"my message");
+        let z = U256::from_big_endian(&double_sha256(b"my message"));
 
         // This is just for testing purposes
         let z_from_str = U256::from_str_radix(
@@ -488,11 +490,33 @@ mod tests {
         ];
 
         for (hex_value, file_path) in values.iter() {
-            let value = U256::from_str_radix(hex_value, 16).unwrap();
-            let base58_encoding = crate::serialise::_encode_base58(value).unwrap();
+            let bytes = utils::decode_hex(hex_value).expect("Failed to convert to bytes");
+            let base58_encoding = crate::serialise::_encode_base58(&bytes).unwrap();
             let mut correct_value = std::fs::read_to_string(file_path).unwrap();
             correct_value.pop();
             assert_eq!(base58_encoding, correct_value);
+        }
+    }
+
+    #[test]
+    fn test_address_format_ex5(){
+        let sec_pairs = [
+            (U256::from(5002), false, true, "mmTPbXQFxboEtNRkwfh6K51jvdtHLxGeMA"),
+            (U256::from(2020_u128.pow(5)), true, true, "mopVkxp8UhXqRYbCYJsbeE1h1fiF64jcoH"),
+            (
+                U256::from_str_radix("12345deadbeef", 16).unwrap(), true, false,
+                "1F1Pn2y6pDb68E5nYJJeba4TLg2U7B6KF1"
+            ),
+        ];
+
+        for (secret, compressed, testnet, address) in sec_pairs {
+            let private_key = PrivateKey::new(secret).expect("Cannot make private key");
+            let computed_address =
+                &private_key.point().address(compressed, testnet).expect("Failed to get address");
+            assert_eq!(
+                computed_address,
+                address,
+            );
         }
     }
 }

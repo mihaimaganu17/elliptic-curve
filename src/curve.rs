@@ -3,6 +3,12 @@ use core::fmt::Debug;
 use core::ops::{Add, Div, Mul, Sub};
 use finite_field::{Element, FieldElement, FieldElementError};
 use primitive_types::U256;
+use crate::{hashing::hash160, serialise::{encode_base58_checksum, EncodingError}};
+
+// Prefix used to be appended before computing the address which resided on the mainnet
+const MAINNET_PREFIX: u8 = 0x00;
+// Prefix used to be appended before computing the address which resided on the testnet
+const TESTNET_PREFIX: u8 = 0x6f;
 
 /// Represents a point on an elliptic curve.
 /// We could make the curse a generic parameter?
@@ -461,6 +467,35 @@ impl Secp256K1Point {
         Ok(sec)
     }
 
+    // Computes the `hash160` variant of the sec compressed format
+    pub fn hash160(&self, compressed: bool) -> Result<Vec<u8>, Secp256K1PointError> {
+        // Encode the point in the SEC format
+        let sec = self.sec(compressed)?;
+
+        // Hash the SEC encoding using the `hash160`
+        let hash160_bytes = hash160(&sec);
+
+        Ok(hash160_bytes)
+    }
+
+    /// Computes the Address Format of this point
+    pub fn address(&self, compressed: bool, testnet: bool) -> Result<String, Secp256K1PointError> {
+        // Compute the hash160 of the SEC format
+        let mut hash160 = self.hash160(compressed)?;
+
+        // Check if we are generating the address for a testnet
+        let prefix = match testnet {
+            true => TESTNET_PREFIX,
+            false => MAINNET_PREFIX,
+        };
+
+        // Add the prefix to our hashed bytes
+        hash160.insert(0, prefix);
+
+        // Encode the result into a Base58 + checksum and return it
+        Ok(encode_base58_checksum(&hash160)?)
+    }
+
     // Verifies that the signature hash `z` corresponds with the given `signature`
     pub fn verify(&self, z: U256, signature: Signature) -> Result<bool, Secp256K1PointError> {
         // Fetch the generator point for hte Bitcoin curve
@@ -535,6 +570,8 @@ pub enum Secp256K1PointError {
     UnknownMarker(u8),
     CompressingNone,
     DataTooShort,
+    EncodingError(EncodingError),
+    FromUtf8Error(std::string::FromUtf8Error),
 }
 
 impl From<uint::FromStrRadixErr> for Secp256K1PointError {
@@ -546,6 +583,18 @@ impl From<uint::FromStrRadixErr> for Secp256K1PointError {
 impl From<FieldElementError> for Secp256K1PointError {
     fn from(err: FieldElementError) -> Self {
         Self::FieldElementError(err)
+    }
+}
+
+impl From<EncodingError> for Secp256K1PointError {
+    fn from(err: EncodingError) -> Self {
+        Self::EncodingError(err)
+    }
+}
+
+impl From<std::string::FromUtf8Error> for Secp256K1PointError {
+    fn from(err: std::string::FromUtf8Error) -> Self {
+        Self::FromUtf8Error(err)
     }
 }
 
