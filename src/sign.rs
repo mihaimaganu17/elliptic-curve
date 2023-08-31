@@ -1,9 +1,14 @@
 use crate::curve::{pow_mod, Secp256K1Point, Secp256K1PointError};
-use crate::serialise::{encode_der_value, EncodingError, DER_ENCODING_MARKER, DER_MAX_LEN};
+use crate::serialise::{encode_der_value, encode_base58_checksum,
+    EncodingError, DER_ENCODING_MARKER, DER_MAX_LEN};
 use finite_field::Element;
 use hmac::{Hmac, Mac};
 use primitive_types::U256;
 use sha2::Sha256;
+
+const WIF_TESTNET_PREFIX: u8 = 0xef;
+const WIF_MAINNET_PREFIX: u8 = 0x80;
+const WIF_COMPRESSED_SUFFIX: u8 = 0x01;
 
 #[derive(Debug)]
 pub struct Signature {
@@ -79,6 +84,36 @@ impl PrivateKey {
             point,
             generator,
         })
+    }
+
+    /// Serializes the private key in an `Wallet Import Format`
+    pub fn wif(&self, compressed: bool, testnet: bool) -> Result<String, Secp256K1PointError> {
+        // Create a vector with a capacity to store a U256, aka 32 byte number and 2 more other
+        // values, one of which is optional
+        let mut buffer = Vec::with_capacity(34);
+        // Resize it in order to fill it with 32 zeros
+        buffer.resize(32, 0);
+
+        // Convert the `U256` into a big endian slice
+        self.secret.to_big_endian(&mut buffer);
+
+
+        // Get the prefix based on the testnet
+        let prefix = match testnet {
+            true => WIF_TESTNET_PREFIX,
+            false => WIF_MAINNET_PREFIX,
+        };
+
+        // Insert the prefix as the firt byte
+        buffer.insert(0, prefix);
+
+        // If we are required to compress it, we also add a suffix
+        if compressed {
+            buffer.push(WIF_COMPRESSED_SUFFIX);
+        }
+
+        // Encode it into Base58 and add a checksum
+        Ok(encode_base58_checksum(&buffer)?)
     }
 
     pub fn point(&self) -> Secp256K1Point {

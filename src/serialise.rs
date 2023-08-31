@@ -1,4 +1,4 @@
-use primitive_types::U256;
+use primitive_types::{U256, U512};
 use uint::FromStrRadixErr;
 use crate::hashing::double_sha256;
 
@@ -73,11 +73,12 @@ pub fn _encode_base58(buffer: &[u8]) -> Result<String, EncodingError> {
     // Instantiate an empty string to store th result
     let mut encoding = String::from("");
 
-    // Encode the given value in an U256 value
-    let mut value = U256::from_big_endian(buffer);
+    // Encode the given value in an U512 value
+    // This is in order to cover the WIF as well
+    let mut value = U512::from_big_endian(buffer);
 
     // While our value is not zero
-    while value > U256::zero() {
+    while value > U512::zero() {
         // Compute the remainder of the operation
         let remainder: usize = (value % _BASE58_ALPHABET.len()).as_usize();
         // Get the mapped value from the Base58 alphabet. Since we cannot inter string slices

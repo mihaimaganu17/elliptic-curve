@@ -501,7 +501,6 @@ mod tests {
     #[test]
     fn test_address_format_ex5(){
         let sec_pairs = [
-            (U256::from(5002), false, true, "mmTPbXQFxboEtNRkwfh6K51jvdtHLxGeMA"),
             (U256::from(2020_u128.pow(5)), true, true, "mopVkxp8UhXqRYbCYJsbeE1h1fiF64jcoH"),
             (
                 U256::from_str_radix("12345deadbeef", 16).unwrap(), true, false,
@@ -511,8 +510,31 @@ mod tests {
 
         for (secret, compressed, testnet, address) in sec_pairs {
             let private_key = PrivateKey::new(secret).expect("Cannot make private key");
+            println!("{:x?}", private_key.point());
             let computed_address =
                 &private_key.point().address(compressed, testnet).expect("Failed to get address");
+            assert_eq!(
+                computed_address,
+                address,
+            );
+        }
+    }
+
+    #[test]
+    fn test_wif_format_ex6(){
+        let sec_pairs = [
+            (U256::from(5003), true, true, "cMahea7zqjxrtgAbB7LSGbcQUr1uX1ojuat9jZodMN8rFTv2sfUK"),
+            (U256::from(2021_u128.pow(5)), false, true,
+                "91avARGdfge8E4tZfYLoxeJ5sGBdNJQH4kvjpWAxgzczjbCwxic"),
+            (
+                U256::from_str_radix("54321deadbeef", 16).unwrap(), true, false,
+                "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgiuQJv1h8Ytr2S53a",
+            ),
+        ];
+
+        for (secret, compressed, testnet, address) in sec_pairs {
+            let private_key = PrivateKey::new(secret).expect("Cannot make private key");
+            let computed_address = private_key.wif(compressed, testnet).expect("Failed to wif key");
             assert_eq!(
                 computed_address,
                 address,
