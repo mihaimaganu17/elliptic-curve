@@ -3,6 +3,8 @@ pub mod hashing;
 pub mod serialise;
 pub mod sign;
 pub mod utils;
+pub mod tx;
+pub mod io;
 
 #[cfg(test)]
 mod tests {
@@ -510,7 +512,6 @@ mod tests {
 
         for (secret, compressed, testnet, address) in sec_pairs {
             let private_key = PrivateKey::new(secret).expect("Cannot make private key");
-            println!("{:x?}", private_key.point());
             let computed_address =
                 &private_key.point().address(compressed, testnet).expect("Failed to get address");
             assert_eq!(
