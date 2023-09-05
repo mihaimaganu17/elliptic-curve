@@ -30,11 +30,20 @@ impl From<ReaderError> for VersionError {
     }
 }
 
+/// Bitcoin's inputs are spending outputs of a previous transaction. Each input needs 2 things:
+/// - A reference to bitcoins you received previously
+/// - Proof that these are yours to spend
+pub struct Input;
+
+/// Represents a collection of multiple inputs
+pub struct Inputs(Vec<Input>);
+
 /// Represents a Bitcoin transaction
 pub struct Transaction<I: TxInput, O: TxOutput> {
     // Version of the transaction, indicating what additional features the transaction uses
     version: Version,
-    // Inputs define what bitcoins are being spent
+    // Inputs define what bitcoins are being spent. Bitcoin's inputs are spending outputs of a
+    // previous transaction.
     inputs: I,
     // Outputs define where bitcoins are going
     outputs: O,
