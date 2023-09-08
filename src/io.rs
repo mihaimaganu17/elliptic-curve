@@ -14,6 +14,10 @@ impl Reader {
         }
     }
 
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
     pub fn read<P: PrimitiveRead, E: ReadEndian<P>>(&mut self) -> Result<P, ReaderError> {
         // Compute the bytes we need to read based on the size of the type
         let bytes_to_read = core::mem::size_of::<P>();
