@@ -15,7 +15,10 @@ pub trait TxInput: Sized {
 /// Must be implemented by any type that has to be a transaction output
 pub trait TxOutput: Sized {
     type Error: Debug;
+    // Parse `Self` from a `Reader` which is backed by a vector of bytes
     fn parse(reader: &mut Reader) -> Result<Self, Self::Error>;
+    // Serializes `Self` into a structure of bytes, represented by `Vec<u8>`
+    fn as_vec(self) -> Result<Vec<u8>, Self::Error>;
 }
 
 /// Represents version of a transaction
@@ -114,11 +117,11 @@ pub struct Output {
     // a bitcoin. The absolute maximum for the amount is the asymptotic limit of 21 million
     // bitcoins in satoshis, whic is 2,1 * 10.pow(5*3), or 2,100 trillion satoshis. This number is
     // > 2*32 and is thus stored in 64 bits, little endian serialised
-    pub amount: u64,
+    amount: u64,
     // A locked box that can only be openede by the holder of the key. It's like a one-way safe
     // that can receive deposits from anyone, but can only be opened by the owner of the safe.
     // This is a variable length field and is preceded by the length of the field in a variant.
-    pub script_pub_key: Option<Vec<u8>>,
+    script_pub_key: Vec<u8>,
 }
 
 impl TxOutput for Output {
@@ -128,12 +131,48 @@ impl TxOutput for Output {
         let amount = reader.read::<u64, LittleEndian>()?;
         // Read the script pub key variant, which represents the length of the script pub key
         let script_pub_key_len = usize::try_from(Variant::parse(reader)?.as_u64())?;
-        let script_pub_key = Some(reader.read_bytes(script_pub_key_len)?.to_vec());
+        let script_pub_key = reader.read_bytes(script_pub_key_len)?.to_vec();
 
         Ok(Self {
             amount,
             script_pub_key,
         })
+    }
+
+    fn as_vec(mut self) -> Result<Vec<u8>, Self::Error> {
+        // First we need to represent the script pub key length as a `u64`
+        let script_pub_key_len = u64::try_from(self.script_pub_key.len())?;
+        // The lengths are encoded as `Variants` in order to save up space
+        let mut script_pub_key_variant = Variant::from(script_pub_key_len).encode();
+
+        // Now that we know all the sizes of the fields we want to serialize, we can compute the
+        // entire size of the resulting `Vec`
+        let vec_len =
+            core::mem::size_of::<u64>() + script_pub_key_variant.len() + self.script_pub_key.len();
+        // Allocate a `Vec` with the desired capacity
+        let mut serialized = Vec::with_capacity(vec_len);
+
+        // Convert `amount` to a vector of bytes we can serialize
+        let mut amount_bytes = self.amount.to_le_bytes().to_vec();
+
+        // Concatenate the bytes of the amount field
+        serialized.append(&mut amount_bytes);
+        // Concatenate the length of the variant
+        serialized.append(&mut script_pub_key_variant);
+        // Concatenate the script pub key
+        serialized.append(&mut self.script_pub_key);
+
+        Ok(serialized)
+    }
+}
+
+impl Output {
+    fn amount(&self) -> u64 {
+        self.amount
+    }
+
+    fn script_pub_key(&self) -> &[u8] {
+        &self.script_pub_key
     }
 }
 
@@ -302,7 +341,7 @@ mod tests {
         let tx: Transaction<Input, Output> =
             Transaction::from_reader(&mut tx_reader).expect("Failed to parse the transaction");
 
-        let script_pub_key = Some(vec![
+        let script_pub_key = vec![
                 0x76,
                 0xa9,
                 0x14,
@@ -328,9 +367,8 @@ mod tests {
                 0x79,
                 0x88,
                 0xac,
-            ]
-        );
-        assert_eq!(script_pub_key, tx.outputs[0].script_pub_key);
-        assert_eq!(4000_0000, tx.outputs[1].amount);
+        ];
+        assert_eq!(&script_pub_key, tx.outputs[0].script_pub_key());
+        assert_eq!(4000_0000, tx.outputs[1].amount());
     }
 }
