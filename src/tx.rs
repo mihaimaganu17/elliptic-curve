@@ -1,6 +1,5 @@
 use core::num::TryFromIntError;
 use core::fmt::Debug;
-use std::time::Duration;
 use primitive_types::U256;
 use crate::hashing;
 use crate::utils::{Variant, VariantError};
@@ -11,13 +10,15 @@ pub trait TxInput: Sized {
     type Error: Debug;
     // Provides the ability to parse the current object from a `Reader`
     fn parse(reader: &mut Reader) -> Result<Self, Self::Error>;
+    // Serialises `Self` into a structure of bytes, represented by `Vec<u8>`
+    fn as_vec(self) -> Result<Vec<u8>, Self::Error>;
 }
 /// Must be implemented by any type that has to be a transaction output
 pub trait TxOutput: Sized {
     type Error: Debug;
     // Parse `Self` from a `Reader` which is backed by a vector of bytes
     fn parse(reader: &mut Reader) -> Result<Self, Self::Error>;
-    // Serializes `Self` into a structure of bytes, represented by `Vec<u8>`
+    // Serialises `Self` into a structure of bytes, represented by `Vec<u8>`
     fn as_vec(self) -> Result<Vec<u8>, Self::Error>;
 }
 
@@ -31,6 +32,10 @@ impl Version {
         let major = reader.read::<u32, BigEndian>()?;
 
         Ok(Self { major })
+    }
+
+    pub fn as_vec(self) -> Vec<u8> {
+        self.major.to_le_bytes().to_vec()
     }
 }
 
@@ -57,7 +62,7 @@ pub struct Input {
     prev_tx_idx: u32,
     // Script signature. Opening a locked box-something that can only be done by the owner of the
     // transaction output. This is a variable length field
-    pub script_sig: Option<Vec<u8>>,
+    script_sig: Vec<u8>,
     // Sequence, originally intended as a way to do what Satoshi called "high-frequency trades"
     // with the locktime field, but is currently used with Replace-By-Fee(RBF) and
     // OP_CHECKSEQUENCEVERIFY.
@@ -98,8 +103,8 @@ impl TxInput for Input {
         let prev_tx_idx = reader.read::<u32, LittleEndian>()?;
         // Read the variant that tells us how long the script is
         let script_len = usize::try_from(Variant::parse(reader)?.as_u64())?;
-        // We default to an empty script signature
-        let script_sig = Some(reader.read_bytes(script_len)?.to_vec());
+        // Read the script signature
+        let script_sig = reader.read_bytes(script_len)?.to_vec();
         // Sequence
         let seq = reader.read::<u32, LittleEndian>()?;
 
@@ -109,6 +114,46 @@ impl TxInput for Input {
             script_sig,
             seq,
         })
+    }
+
+    fn as_vec(mut self) -> Result<Vec<u8>, Self::Error> {
+        // Convert the script signature length to a `u64` so we can encode it as a Variant
+        let script_len = u64::try_from(self.script_sig.len())?;
+        // Compute the variant encoding of the length of the `script_sig` field
+        let mut script_sig_variant = Variant::from(script_len).encode();
+
+        // Compute the total size we need to allocate for our `Vec`
+        let alloc_size = core::mem::size_of::<U256>() + core::mem::size_of::<u32>() +
+            script_sig_variant.len() + self.script_sig.len() + core::mem::size_of::<u32>();
+
+        // Allocate the Vec
+        let mut serialized = Vec::with_capacity(alloc_size);
+
+        // Resize and add the previous transaction id
+        serialized.resize(core::mem::size_of::<U256>(), 0);
+        self.prev_tx_id.to_little_endian(&mut serialized[0..core::mem::size_of::<U256>()]);
+
+        // Convert the previous transaction index into a `Vec`
+        let mut prev_tx_idx_bytes = self.prev_tx_idx.to_le_bytes().to_vec();
+        // Append it to the serialized vector
+        serialized.append(&mut prev_tx_idx_bytes);
+        // Append the variant
+        serialized.append(&mut script_sig_variant);
+        // Append the script signature bytes
+        serialized.append(&mut self.script_sig);
+
+        // Convert the sequence field to bytes
+        let mut seq_bytes = self.seq.to_le_bytes().to_vec();
+        // Append the sequence bytes to serialized `Vec`
+        serialized.append(&mut seq_bytes);
+
+        Ok(serialized)
+    }
+}
+
+impl Input {
+    pub fn script_sig(&self) -> &[u8] {
+        &self.script_sig
     }
 }
 
@@ -222,6 +267,10 @@ impl Locktime {
         let value = reader.read::<u32, LittleEndian>()?;
         Ok(Self(value))
     }
+
+    pub fn as_vec(mut self) -> Vec<u8> {
+        self.0.to_le_bytes().to_vec()
+    }
 }
 
 /// Represents a Bitcoin transaction
@@ -249,6 +298,57 @@ impl<I: TxInput, O: TxOutput> Transaction<I, O> {
     /// Return the hexadecimal representation of this transaction's hash
     pub fn id(&self) -> String {
         self.hash().into_iter().fold(String::from(""), |acc, b| format!("{acc}{b:x}"))
+    }
+
+    pub fn encode(mut self) -> Result<Vec<u8>, TxError> {
+        // We allocate a new `Vec` that will hold all the serialized data
+        let mut serialized = vec![];
+
+        // First we encode the version
+        let mut version_bytes = self.version.as_vec();
+        // Append it to the serialized `Vec`
+        serialized.append(&mut version_bytes);
+
+        // Convert the length of the inputs into a `u64`
+        let input_len = u64::try_from(self.inputs.len())?;
+        // Convert the length of the input into a variant and encode it
+        let mut input_len_variant = Variant::from(input_len).encode();
+        // Next we want to append the variant with length of the inputs
+        serialized.append(&mut input_len_variant);
+
+        // Next we go through each of the inputs and we serialize it
+        for input in self.inputs.into_iter() {
+            // Encode the inputs as a vector of bytes
+            let mut input_bytes = input
+                .as_vec()
+                .map_err(|e| TxError::InputError(format!("{e:?}")))?;
+            // Append it to the serialized vector
+            serialized.append(&mut input_bytes);
+        }
+
+        // Convert the length of the outputs into a `u64`
+        let output_len = u64::try_from(self.outputs.len())?;
+        // Convert the length of the outputs into a variant and encode it
+        let mut output_len_variant = Variant::from(output_len).encode();
+        // Next we want to append the variant with length of the outputs
+        serialized.append(&mut output_len_variant);
+
+        // Next we go through each of the outputs and we serialize it
+        for output in self.outputs.into_iter() {
+            // Encode the inputs as a vector of bytes
+            let mut output_bytes = output
+                .as_vec()
+                .map_err(|e| TxError::OutputError(format!("{e:?}")))?;
+            // Append it to the serialized vector
+            serialized.append(&mut output_bytes);
+        }
+
+        // Encode the locktime into a `Vec`
+        let mut locktime_bytes = self.locktime.as_vec();
+        // Append it to the serialized `Vec`
+        serialized.append(&mut locktime_bytes);
+
+        Ok(serialized)
     }
 
     pub fn from_reader(reader: &mut Reader) -> Result<Self, TxError> {
