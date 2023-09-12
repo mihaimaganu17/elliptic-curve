@@ -1,9 +1,12 @@
-use core::num::TryFromIntError;
+use core::num::{TryFromIntError, ParseIntError};
 use core::fmt::Debug;
 use primitive_types::U256;
+use reqwest::blocking::Response;
 use crate::hashing;
-use crate::utils::{Variant, VariantError};
+use crate::utils::{decode_hex, Variant, VariantError};
 use crate::io::{Reader, ReaderError, BigEndian, LittleEndian};
+use std::collections::HashMap;
+use serde::Deserialize;
 
 /// Must be implemented by any type that has to be added as a transaction input
 pub trait TxInput: Sized {
@@ -23,6 +26,7 @@ pub trait TxOutput: Sized {
 }
 
 /// Represents version of a transaction
+#[derive(Debug)]
 pub struct Version {
     major: u32,
 }
@@ -246,6 +250,52 @@ impl From<TryFromIntError> for OutputError {
     }
 }
 
+/// Represents an element from one of the Witness' stack. See more on `Witness` documentation.
+/// Each element on the stack is encoded a pair of a Variant and the actual data, that has the
+/// length specified by that variant.
+pub struct StackElement;
+
+impl StackElement {
+    /// Tries to read an encoded `StackElement` from an underlying `Reader` buffer
+    pub fn parse(reader: &mut Reader) -> Result<Self, TxError> {
+        // Read the length of the data for this element
+        let data_len = Variant::parse(reader)?.as_u64();
+        // Convert it into a `usize`
+        let data_len = usize::try_from(data_len)?;
+        // Read the data bytes, just for safety
+        let _data = reader.read_bytes(data_len)?;
+
+        Ok(Self)
+    }
+}
+
+/// This structure represents the Witness from the segregated witness protocol. It is intended to
+/// provide protection from transaction malleability and increase block capacity. Each witness has
+/// a stack with a variable number of elements.
+pub struct Witness {
+    stack: Vec<StackElement>,
+}
+
+impl Witness {
+    pub fn parse(reader: &mut Reader) -> Result<Self, TxError> {
+        // Read the number of elements that the stack of this Witness has
+        let elem_len = Variant::parse(reader)?.as_u64();
+        // Convert it into a `usize`
+        let elem_len = usize::try_from(elem_len)?;
+        // Initialize a stack with the desired size
+        let mut stack = Vec::with_capacity(elem_len);
+        // We read each element from the reader
+        for idx in 0..elem_len {
+            let elem = StackElement::parse(reader)?;
+            // Push the element onto the stack
+            stack.push(elem);
+        }
+
+        // Initialize and return the Witness
+        Ok(Self { stack })
+    }
+}
+
 /// Locktime is a way to time-delay a transaction. A transaction with a locktime of 600,000 cannot
 /// go into the blockchain until block 600,001.
 /// If the locktime is >= 500,000,000 it represents a Unix timestamp.
@@ -260,6 +310,7 @@ impl From<TryFromIntError> for OutputError {
 ///
 /// The uses before BIP0065 were limited. BIP0065 introduces OP_CHECKLOCKTIMEVERIFY, which makes
 /// locktime more useful by making an output unspendable until a ceratin locktime.
+#[derive(Copy, Clone)]
 pub struct Locktime(u32);
 
 impl Locktime {
@@ -298,6 +349,16 @@ impl<I: TxInput, O: TxOutput> Transaction<I, O> {
     /// Return the hexadecimal representation of this transaction's hash
     pub fn id(&self) -> String {
         self.hash().into_iter().fold(String::from(""), |acc, b| format!("{acc}{b:x}"))
+    }
+
+    /// Return the locktime field
+    pub fn locktime(&self) -> Locktime {
+        self.locktime
+    }
+
+    /// Return the testnet field
+    pub fn testnet(&self) -> bool {
+        self.testnet
     }
 
     pub fn encode(mut self) -> Result<Vec<u8>, TxError> {
@@ -351,9 +412,28 @@ impl<I: TxInput, O: TxOutput> Transaction<I, O> {
         Ok(serialized)
     }
 
-    pub fn from_reader(reader: &mut Reader) -> Result<Self, TxError> {
+    /// Parse a new transaction from a sequence of bytes.
+    pub fn from_reader(reader: &mut Reader, testnet: bool) -> Result<Self, TxError> {
         // Read the version
         let version = Version::parse(reader)?;
+
+        // We peek a single byte
+        let next_byte = reader.peek::<u8, LittleEndian>()?;
+
+        // If that byte is 0x00, this means the transaction encoding also contains witness data.
+        // To be more specific Segregated witness data.
+        let has_segwit = next_byte == 0x00;
+
+        // If it does, we also need to read another byte, that has to be 0x01. Since we did not
+        // read the previous byte and we just picked it, we will read 2 bytes so we put the cursor
+        // into the proper place
+        if has_segwit {
+            let segwit_flag = reader.read_bytes(2)?;
+            // Check if the array matches our expectation
+            if segwit_flag != [0x00, 0x01] {
+                return Err(TxError::BadWitnessFlag);
+            }
+        }
 
         // Read the number of inputs that the transaction has
         let inputs_len = Variant::parse(reader)?.as_u64();
@@ -380,6 +460,20 @@ impl<I: TxInput, O: TxOutput> Transaction<I, O> {
             outputs.push(O::parse(reader).map_err(|e| TxError::OutputError(format!("{e:?}")))?);
         }
 
+        // At this point, we need to check if we have a witness flag.
+        let segwit = if has_segwit {
+            // Initialize a stack with the desired size
+            let mut segwits= Vec::with_capacity(inputs_len);
+            // read each witness
+            for idx in 0..inputs_len {
+                let witness = Witness::parse(reader)?;
+                segwits.push(witness);
+            }
+            Some(segwits)
+        } else {
+            None
+        };
+
         // Read the locktime
         let locktime = Locktime::parse(reader)?;
 
@@ -388,7 +482,7 @@ impl<I: TxInput, O: TxOutput> Transaction<I, O> {
             inputs,
             outputs,
             locktime,
-            testnet: true,
+            testnet,
         })
     }
 }
@@ -401,6 +495,10 @@ pub enum TxError {
     TryFromInt(TryFromIntError),
     InputError(String),
     OutputError(String),
+    Reqwest(reqwest::Error),
+    ParseInt(ParseIntError),
+    BadWitnessFlag,
+    TxFetchFailed(U256),
 }
 
 impl From<ReaderError> for TxError {
@@ -427,10 +525,93 @@ impl From<VersionError> for TxError {
     }
 }
 
+impl From<ParseIntError> for TxError {
+    fn from(err: ParseIntError) -> Self {
+        Self::ParseInt(err)
+    }
+}
+
+impl From<reqwest::Error> for TxError {
+    fn from(err: reqwest::Error) -> Self {
+        Self::Reqwest(err)
+    }
+}
+
+pub struct TxFetcher<I: TxInput, O: TxOutput> {
+    // Cached transaction IDs
+    cache: HashMap<U256, Transaction<I, O>>,
+}
+
+/// Wraps a raw transaction, represented by a hex string
+#[derive(Deserialize, Debug)]
+pub struct RawTx {
+    pub hex: String,
+}
+
+impl<I: TxInput, O: TxOutput> TxFetcher<I, O> {
+    pub fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+        }
+    }
+    pub fn url(&self, testnet: bool) -> String {
+        match testnet {
+            true => "https://api.blockcypher.com/v1/btc/test3/txs".to_string(),
+            false => "https://api.blockcypher.com/v1/btc/main/txs".to_string(),
+        }
+    }
+
+    pub fn fetch(
+        &mut self,
+        tx_id: U256,
+        testnet: bool,
+        fresh: bool
+    ) -> Result<&Transaction<I, O>, TxError>{
+        // If we are not requested to provide fresh info or we do not have the transaction id in
+        // our cache
+        if fresh || !self.cache.contains_key(&tx_id) {
+            // Get the base url for the request
+            let base_url = self.url(testnet);
+            // Create the request with the transaction id
+            let url = format!("{base_url}/{:x}", tx_id);
+            // Prepare the query parameters. We are interested in the hex representation of the
+            // transaction
+            let url_form = HashMap::from([("includeHex", "true")]);
+
+            // Build the request and execute it
+            let response = reqwest::blocking::Client::new()
+                .get(url)
+                .query(&[("includeHex", "true")])
+                .send()?;
+
+            // Fetch the hex field of the response
+            let raw_tx: RawTx = response.json()?;
+            // We get the transaction in as a UTF-8 string with hex bytes in it. So we must convert
+            // it to a u8 slice before parsing it.
+            let raw_tx = decode_hex(raw_tx.hex.as_ref())?;
+            // Create a reader from the raw transaction
+            let mut reader = Reader::from_vec(raw_tx);
+            // Parse the transaction from the reader
+            let tx = Transaction::<I, O>::from_reader(&mut reader, testnet)?;
+            // Insert the transaction into the cache
+            self.cache.insert(tx_id, tx);
+        }
+
+        // Check if we have the transaction
+        match self.cache.get(&tx_id) {
+            // If we do, return it
+            Some(cached_tx) => Ok(cached_tx),
+            // If not, return an error
+            None => Err(TxError::TxFetchFailed(tx_id)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Transaction, Input, Output};
+    use super::{Transaction, Input, Output, TxFetcher};
     use crate::io::Reader;
+    use primitive_types::U256;
 
     #[test]
     fn test_transaction_parsing() {
@@ -439,7 +620,7 @@ mod tests {
         let mut tx_reader = Reader::from_vec(tx_bytes);
 
         let tx: Transaction<Input, Output> =
-            Transaction::from_reader(&mut tx_reader).expect("Failed to parse the transaction");
+            Transaction::from_reader(&mut tx_reader, true).expect("Failed to parse the transaction");
 
         let script_pub_key = vec![
                 0x76,
@@ -470,5 +651,16 @@ mod tests {
         ];
         assert_eq!(&script_pub_key, tx.outputs[0].script_pub_key());
         assert_eq!(4000_0000, tx.outputs[1].amount());
+    }
+
+    #[test]
+    fn test_tx_fetcher() {
+        let tx_id = U256::from_str_radix(
+            "ea10065fa8de76bcb2e9a4f38b66eb6b7bd38c829a5d2426b4c6ebdcb486b3a9",
+            16
+        ).expect("Failed to convert transaction id");
+
+        let mut tx_fetcher: TxFetcher<Input, Output> = TxFetcher::new();
+        tx_fetcher.fetch(tx_id, true, true).expect("Failed to fetch transaction");
     }
 }

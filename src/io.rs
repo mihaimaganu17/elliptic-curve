@@ -1,6 +1,7 @@
 use core::array::TryFromSliceError;
 
 /// Wrapper that reads over a stream of bytes
+// This can be turned into a trait
 pub struct Reader {
     cursor: usize,
     bytes: Vec<u8>,
@@ -18,6 +19,13 @@ impl Reader {
         self.cursor
     }
 
+    /// Returns the amount of bytes not read from the cursor point up until the end of the buffer
+    pub fn bytes_unread(&self) -> usize {
+        self.bytes.len() - self.cursor
+    }
+
+    /// Read the desired primitive `P` type from the underlying buffer. This function moves the
+    /// cursor forward by the amount of bytes that were read
     pub fn read<P: PrimitiveRead, E: ReadEndian<P>>(&mut self) -> Result<P, ReaderError> {
         // Compute the bytes we need to read based on the size of the type
         let bytes_to_read = core::mem::size_of::<P>();
@@ -28,14 +36,35 @@ impl Reader {
         Ok(E::from_bytes(bytes)?)
     }
 
+    /// Peek the desired primitive `P` type from the underlying buffer. Unlike `read`, this
+    /// function does not move the cursor forward.
+    pub fn peek<P: PrimitiveRead, E: ReadEndian<P>>(&mut self) -> Result<P, ReaderError> {
+        // Compute the bytes we need to read based on the size of the type
+        let bytes_to_peek = core::mem::size_of::<P>();
+        // Read the bytes from the buffer
+        let bytes = self.peek_bytes(bytes_to_peek)?;
+
+        // Create the type from the given bytes
+        Ok(E::from_bytes(bytes)?)
+    }
+
     /// Read `count` bytes from the buffer
     pub fn read_bytes(&mut self, count: usize) -> Result<&[u8], ReaderError> {
+        // Read the number of requested bytes
         let bytes_read =
             self.bytes.get(self.cursor..(self.cursor + count)).ok_or(ReaderError::BufferTooSmall)?;
         // Update the cursor
         self.cursor += count;
         // Return the read bytes
         Ok(bytes_read)
+    }
+
+    /// Peek a number of `count` bytes from the underlying stream. This function does not move the
+    /// stream cursor forward, unlike `read_bytes`
+    pub fn peek_bytes(&self, count: usize) -> Result<&[u8], ReaderError> {
+        let bytes_peeked =
+            self.bytes.get(self.cursor..(self.cursor + count)).ok_or(ReaderError::BufferTooSmall)?;
+        Ok(bytes_peeked)
     }
 }
 
@@ -154,5 +183,16 @@ mod tests {
         let magic = reader.read::<u64, LittleEndian>().expect("Failed to read u32 integer");
 
         assert!(magic == 0xfeca0bb0bebafeca);
+    }
+
+    #[test]
+    fn test_peek_primitive() {
+        let bytes = std::fs::read("testdata/cafebabeb00bcafe.bin").unwrap();
+        let mut reader = Reader::from_vec(bytes);
+        assert!(reader.cursor() == 0usize);
+
+        let magic = reader.peek::<u64, LittleEndian>().expect("Failed to read u32 integer");
+        assert!(magic == 0xfeca0bb0bebafeca);
+        assert!(reader.cursor() == 0usize);
     }
 }
