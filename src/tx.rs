@@ -1,7 +1,6 @@
 use core::num::{TryFromIntError, ParseIntError};
 use core::fmt::Debug;
 use primitive_types::U256;
-use reqwest::blocking::Response;
 use crate::hashing;
 use crate::utils::{decode_hex, Variant, VariantError};
 use crate::io::{Reader, ReaderError, BigEndian, LittleEndian};
@@ -14,7 +13,9 @@ pub trait TxInput: Sized {
     // Provides the ability to parse the current object from a `Reader`
     fn parse(reader: &mut Reader) -> Result<Self, Self::Error>;
     // Serialises `Self` into a structure of bytes, represented by `Vec<u8>`
-    fn as_vec(self) -> Result<Vec<u8>, Self::Error>;
+    fn as_vec(&self) -> Result<Vec<u8>, Self::Error>;
+    // Return the amount of this input, by referring to the previous transaction
+    fn amount<O: TxOutput>(&self, tx_fetcher: &mut TxFetcher<Self, O>, testnet: bool) -> Result<u64, Self::Error>;
 }
 /// Must be implemented by any type that has to be a transaction output
 pub trait TxOutput: Sized {
@@ -22,7 +23,9 @@ pub trait TxOutput: Sized {
     // Parse `Self` from a `Reader` which is backed by a vector of bytes
     fn parse(reader: &mut Reader) -> Result<Self, Self::Error>;
     // Serialises `Self` into a structure of bytes, represented by `Vec<u8>`
-    fn as_vec(self) -> Result<Vec<u8>, Self::Error>;
+    fn as_vec(&self) -> Result<Vec<u8>, Self::Error>;
+    // Return the amount of satoshis for this output
+    fn amount(&self) -> u64;
 }
 
 /// Represents version of a transaction
@@ -45,12 +48,12 @@ impl Version {
 
 #[derive(Debug)]
 pub enum VersionError {
-    MajorReadFailed,
+    Reader(ReaderError)
 }
 
 impl From<ReaderError> for VersionError {
     fn from(err: ReaderError) -> Self {
-        Self::MajorReadFailed
+        Self::Reader(err)
     }
 }
 
@@ -78,6 +81,7 @@ pub enum InputError {
     Reader(ReaderError),
     Variant(VariantError),
     TryFromInt(TryFromIntError),
+    TxFetch(TxFetchError),
 }
 
 impl From<ReaderError> for InputError {
@@ -95,6 +99,12 @@ impl From<VariantError> for InputError {
 impl From<TryFromIntError> for InputError {
     fn from(err: TryFromIntError) -> Self {
         Self::TryFromInt(err)
+    }
+}
+
+impl From<TxFetchError> for InputError {
+    fn from(err: TxFetchError) -> Self {
+        Self::TxFetch(err)
     }
 }
 
@@ -120,7 +130,14 @@ impl TxInput for Input {
         })
     }
 
-    fn as_vec(mut self) -> Result<Vec<u8>, Self::Error> {
+    // Return the amount of this input, by referring to the previous transaction
+    fn amount<O: TxOutput>(&self, tx_fetcher: &mut TxFetcher<Self, O>, testnet: bool) -> Result<u64, Self::Error> {
+        let prev_tx = tx_fetcher.fetch(self.prev_tx_id, testnet, false)?;
+        let amount = prev_tx.outputs[usize::try_from(self.prev_tx_idx)?].amount();
+        Ok(amount)
+    }
+
+    fn as_vec(&self) -> Result<Vec<u8>, Self::Error> {
         // Convert the script signature length to a `u64` so we can encode it as a Variant
         let script_len = u64::try_from(self.script_sig.len())?;
         // Compute the variant encoding of the length of the `script_sig` field
@@ -144,7 +161,7 @@ impl TxInput for Input {
         // Append the variant
         serialized.append(&mut script_sig_variant);
         // Append the script signature bytes
-        serialized.append(&mut self.script_sig);
+        serialized.extend_from_slice(&self.script_sig);
 
         // Convert the sequence field to bytes
         let mut seq_bytes = self.seq.to_le_bytes().to_vec();
@@ -188,7 +205,7 @@ impl TxOutput for Output {
         })
     }
 
-    fn as_vec(mut self) -> Result<Vec<u8>, Self::Error> {
+    fn as_vec(&self) -> Result<Vec<u8>, Self::Error> {
         // First we need to represent the script pub key length as a `u64`
         let script_pub_key_len = u64::try_from(self.script_pub_key.len())?;
         // The lengths are encoded as `Variants` in order to save up space
@@ -209,18 +226,17 @@ impl TxOutput for Output {
         // Concatenate the length of the variant
         serialized.append(&mut script_pub_key_variant);
         // Concatenate the script pub key
-        serialized.append(&mut self.script_pub_key);
+        serialized.extend_from_slice(&self.script_pub_key);
 
         Ok(serialized)
     }
+
+    // Return the amount of satoshis for this output
+    fn amount(&self) -> u64 { self.amount }
 }
 
 impl Output {
-    fn amount(&self) -> u64 {
-        self.amount
-    }
-
-    fn script_pub_key(&self) -> &[u8] {
+    pub fn script_pub_key(&self) -> &[u8] {
         &self.script_pub_key
     }
 }
@@ -285,7 +301,7 @@ impl Witness {
         // Initialize a stack with the desired size
         let mut stack = Vec::with_capacity(elem_len);
         // We read each element from the reader
-        for idx in 0..elem_len {
+        for _ in 0..elem_len {
             let elem = StackElement::parse(reader)?;
             // Push the element onto the stack
             stack.push(elem);
@@ -293,6 +309,10 @@ impl Witness {
 
         // Initialize and return the Witness
         Ok(Self { stack })
+    }
+
+    pub fn stack(&self) -> &[StackElement] {
+        &self.stack
     }
 }
 
@@ -319,7 +339,7 @@ impl Locktime {
         Ok(Self(value))
     }
 
-    pub fn as_vec(mut self) -> Vec<u8> {
+    pub fn as_vec(&mut self) -> Vec<u8> {
         self.0.to_le_bytes().to_vec()
     }
 }
@@ -359,6 +379,28 @@ impl<I: TxInput, O: TxOutput> Transaction<I, O> {
     /// Return the testnet field
     pub fn testnet(&self) -> bool {
         self.testnet
+    }
+
+    /// Computes and returns the fee as a difference between the `Transaction`'s inputs and outputs.
+    /// This fee is sent to miners as an incentive to mine transactions.
+    pub fn fee(&self) -> Result<u64, TxError> {
+        // Create a new transaction fetcher, to fetch from the blockchain
+        let mut tx_fetcher: TxFetcher<I, O> = TxFetcher::new();
+        // Instantiate the total amount of inputs as 0
+        let mut total_in_amount = 0u64;
+        // Go through each of the inputs
+        for tx_in in self.inputs.iter() {
+            let curr_amount = tx_in.amount(&mut tx_fetcher, self.testnet)
+                .map_err(|e| TxError::InputError(format!("{e:?}")))?;
+            // Increment the value by that amount
+            total_in_amount += curr_amount;
+        }
+
+        // Compute the total amount of outputs as a sum of each respective amount
+        let total_out_amount = self.outputs.iter().fold(0u64, |acc, output| acc + output.amount());
+
+        // Return the difference between the 2
+        Ok(total_in_amount - total_out_amount)
     }
 
     pub fn encode(mut self) -> Result<Vec<u8>, TxError> {
@@ -461,11 +503,11 @@ impl<I: TxInput, O: TxOutput> Transaction<I, O> {
         }
 
         // At this point, we need to check if we have a witness flag.
-        let segwit = if has_segwit {
+        let _segwit = if has_segwit {
             // Initialize a stack with the desired size
             let mut segwits= Vec::with_capacity(inputs_len);
             // read each witness
-            for idx in 0..inputs_len {
+            for _ in 0..inputs_len {
                 let witness = Witness::parse(reader)?;
                 segwits.push(witness);
             }
@@ -525,18 +567,6 @@ impl From<VersionError> for TxError {
     }
 }
 
-impl From<ParseIntError> for TxError {
-    fn from(err: ParseIntError) -> Self {
-        Self::ParseInt(err)
-    }
-}
-
-impl From<reqwest::Error> for TxError {
-    fn from(err: reqwest::Error) -> Self {
-        Self::Reqwest(err)
-    }
-}
-
 pub struct TxFetcher<I: TxInput, O: TxOutput> {
     // Cached transaction IDs
     cache: HashMap<U256, Transaction<I, O>>,
@@ -566,7 +596,7 @@ impl<I: TxInput, O: TxOutput> TxFetcher<I, O> {
         tx_id: U256,
         testnet: bool,
         fresh: bool
-    ) -> Result<&Transaction<I, O>, TxError>{
+    ) -> Result<&Transaction<I, O>, TxFetchError>{
         // If we are not requested to provide fresh info or we do not have the transaction id in
         // our cache
         if fresh || !self.cache.contains_key(&tx_id) {
@@ -574,9 +604,6 @@ impl<I: TxInput, O: TxOutput> TxFetcher<I, O> {
             let base_url = self.url(testnet);
             // Create the request with the transaction id
             let url = format!("{base_url}/{:x}", tx_id);
-            // Prepare the query parameters. We are interested in the hex representation of the
-            // transaction
-            let url_form = HashMap::from([("includeHex", "true")]);
 
             // Build the request and execute it
             let response = reqwest::blocking::Client::new()
@@ -602,14 +629,40 @@ impl<I: TxInput, O: TxOutput> TxFetcher<I, O> {
             // If we do, return it
             Some(cached_tx) => Ok(cached_tx),
             // If not, return an error
-            None => Err(TxError::TxFetchFailed(tx_id)),
+            None => Err(TxFetchError::TxFetchFailed(tx_id)),
         }
+    }
+}
+
+#[derive(Debug)]
+pub enum TxFetchError {
+    ParseInt(ParseIntError),
+    Reqwest(reqwest::Error),
+    TxError(TxError),
+    TxFetchFailed(U256),
+}
+
+impl From<ParseIntError> for TxFetchError {
+    fn from(err: ParseIntError) -> Self {
+        Self::ParseInt(err)
+    }
+}
+
+impl From<reqwest::Error> for TxFetchError {
+    fn from(err: reqwest::Error) -> Self {
+        Self::Reqwest(err)
+    }
+}
+
+impl From<TxError> for TxFetchError {
+    fn from(err: TxError) -> Self {
+        Self::TxError(err)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Transaction, Input, Output, TxFetcher};
+    use super::{Transaction, Input, Output, TxOutput, TxFetcher};
     use crate::io::Reader;
     use primitive_types::U256;
 
@@ -662,5 +715,21 @@ mod tests {
 
         let mut tx_fetcher: TxFetcher<Input, Output> = TxFetcher::new();
         tx_fetcher.fetch(tx_id, true, true).expect("Failed to fetch transaction");
+    }
+
+    #[test]
+    fn test_tx_fee() {
+        let tx_id = U256::from_str_radix(
+            "ea10065fa8de76bcb2e9a4f38b66eb6b7bd38c829a5d2426b4c6ebdcb486b3a9",
+            16
+        ).expect("Failed to convert transaction id");
+
+        let mut tx_fetcher: TxFetcher<Input, Output> = TxFetcher::new();
+        let tx = tx_fetcher.fetch(tx_id, true, true).expect("Failed to fetch transaction");
+
+        let fee = tx.fee().expect("Failed to fetch fee for transaction");
+        // The fee should be 147 satoshis, which is 1 satoshi per vByte, which is the weight of the
+        // blocksize, given by the SegWit algorithm
+        assert!(fee == 147);
     }
 }
