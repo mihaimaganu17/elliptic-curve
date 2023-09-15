@@ -5,6 +5,7 @@ pub mod sign;
 pub mod utils;
 pub mod tx;
 pub mod io;
+pub mod script;
 
 #[cfg(test)]
 mod tests {

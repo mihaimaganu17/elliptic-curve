@@ -68,7 +68,8 @@ pub struct Input {
     // spending. In other words, which output from a previous transaction is used as input here.
     prev_tx_idx: u32,
     // Script signature. Opening a locked box-something that can only be done by the owner of the
-    // transaction output. This is a variable length field
+    // transaction output. This is a variable length field. Represents the key used to open the
+    // locking script from the `Output`'s script pub key
     script_sig: Vec<u8>,
     // Sequence, originally intended as a way to do what Satoshi called "high-frequency trades"
     // with the locktime field, but is currently used with Replace-By-Fee(RBF) and
@@ -184,9 +185,10 @@ pub struct Output {
     // bitcoins in satoshis, whic is 2,1 * 10.pow(5*3), or 2,100 trillion satoshis. This number is
     // > 2*32 and is thus stored in 64 bits, little endian serialised
     amount: u64,
-    // A locked box that can only be openede by the holder of the key. It's like a one-way safe
+    // A locked box that can only be opened by the holder of the key. It's like a one-way safe
     // that can receive deposits from anyone, but can only be opened by the owner of the safe.
     // This is a variable length field and is preceded by the length of the field in a variant.
+    // Also called the locking script.
     script_pub_key: Vec<u8>,
 }
 
