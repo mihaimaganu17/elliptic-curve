@@ -2,6 +2,7 @@ use core::num::{TryFromIntError, ParseIntError};
 use core::fmt::Debug;
 use primitive_types::U256;
 use crate::hashing;
+use crate::script::{Script, ScriptError};
 use crate::utils::{decode_hex, Variant, VariantError};
 use crate::io::{Reader, ReaderError, BigEndian, LittleEndian};
 use std::collections::HashMap;
@@ -23,7 +24,7 @@ pub trait TxOutput: Sized {
     // Parse `Self` from a `Reader` which is backed by a vector of bytes
     fn parse(reader: &mut Reader) -> Result<Self, Self::Error>;
     // Serialises `Self` into a structure of bytes, represented by `Vec<u8>`
-    fn as_vec(&self) -> Result<Vec<u8>, Self::Error>;
+    fn to_vec(self) -> Result<Vec<u8>, Self::Error>;
     // Return the amount of satoshis for this output
     fn amount(&self) -> u64;
 }
@@ -132,7 +133,11 @@ impl TxInput for Input {
     }
 
     // Return the amount of this input, by referring to the previous transaction
-    fn amount<O: TxOutput>(&self, tx_fetcher: &mut TxFetcher<Self, O>, testnet: bool) -> Result<u64, Self::Error> {
+    fn amount<O: TxOutput>(
+        &self,
+        tx_fetcher: &mut TxFetcher<Self, O>,
+        testnet: bool,
+    ) -> Result<u64, Self::Error> {
         let prev_tx = tx_fetcher.fetch(self.prev_tx_id, testnet, false)?;
         let amount = prev_tx.outputs[usize::try_from(self.prev_tx_idx)?].amount();
         Ok(amount)
@@ -189,7 +194,7 @@ pub struct Output {
     // that can receive deposits from anyone, but can only be opened by the owner of the safe.
     // This is a variable length field and is preceded by the length of the field in a variant.
     // Also called the locking script.
-    script_pub_key: Vec<u8>,
+    script_pub_key: Script,
 }
 
 impl TxOutput for Output {
@@ -197,9 +202,8 @@ impl TxOutput for Output {
     fn parse(reader: &mut Reader) -> Result<Self, Self::Error> {
         // Read the amount as a u64
         let amount = reader.read::<u64, LittleEndian>()?;
-        // Read the script pub key variant, which represents the length of the script pub key
-        let script_pub_key_len = usize::try_from(Variant::parse(reader)?.as_u64())?;
-        let script_pub_key = reader.read_bytes(script_pub_key_len)?.to_vec();
+        // Read the script public key
+        let script_pub_key = Script::parse(reader)?;
 
         Ok(Self {
             amount,
@@ -207,16 +211,18 @@ impl TxOutput for Output {
         })
     }
 
-    fn as_vec(&self) -> Result<Vec<u8>, Self::Error> {
+    fn to_vec(self) -> Result<Vec<u8>, Self::Error> {
+        // Convert the script to a vec
+        let mut script_pub_key = self.script_pub_key.to_vec()?;
         // First we need to represent the script pub key length as a `u64`
-        let script_pub_key_len = u64::try_from(self.script_pub_key.len())?;
+        let script_pub_key_len = u64::try_from(script_pub_key.len())?;
         // The lengths are encoded as `Variants` in order to save up space
         let mut script_pub_key_variant = Variant::from(script_pub_key_len).encode();
 
         // Now that we know all the sizes of the fields we want to serialize, we can compute the
         // entire size of the resulting `Vec`
         let vec_len =
-            core::mem::size_of::<u64>() + script_pub_key_variant.len() + self.script_pub_key.len();
+            core::mem::size_of::<u64>() + script_pub_key_variant.len() + script_pub_key.len();
         // Allocate a `Vec` with the desired capacity
         let mut serialized = Vec::with_capacity(vec_len);
 
@@ -228,7 +234,7 @@ impl TxOutput for Output {
         // Concatenate the length of the variant
         serialized.append(&mut script_pub_key_variant);
         // Concatenate the script pub key
-        serialized.extend_from_slice(&self.script_pub_key);
+        serialized.append(&mut script_pub_key);
 
         Ok(serialized)
     }
@@ -238,7 +244,7 @@ impl TxOutput for Output {
 }
 
 impl Output {
-    pub fn script_pub_key(&self) -> &[u8] {
+    pub fn script_pub_key(&self) -> &Script {
         &self.script_pub_key
     }
 }
@@ -246,6 +252,7 @@ impl Output {
 #[derive(Debug)]
 pub enum OutputError {
     Reader(ReaderError),
+    Script(ScriptError),
     Variant(VariantError),
     TryFromInt(TryFromIntError),
 }
@@ -253,6 +260,12 @@ pub enum OutputError {
 impl From<ReaderError> for OutputError {
     fn from(err: ReaderError) -> Self {
         Self::Reader(err)
+    }
+}
+
+impl From<ScriptError> for OutputError {
+    fn from(err: ScriptError) -> Self {
+        Self::Script(err)
     }
 }
 
@@ -392,6 +405,7 @@ impl<I: TxInput, O: TxOutput> Transaction<I, O> {
         let mut total_in_amount = 0u64;
         // Go through each of the inputs
         for tx_in in self.inputs.iter() {
+            // Get the satoshi amount of the current transaction input
             let curr_amount = tx_in.amount(&mut tx_fetcher, self.testnet)
                 .map_err(|e| TxError::InputError(format!("{e:?}")))?;
             // Increment the value by that amount
@@ -442,7 +456,7 @@ impl<I: TxInput, O: TxOutput> Transaction<I, O> {
         for output in self.outputs.into_iter() {
             // Encode the inputs as a vector of bytes
             let mut output_bytes = output
-                .as_vec()
+                .to_vec()
                 .map_err(|e| TxError::OutputError(format!("{e:?}")))?;
             // Append it to the serialized vector
             serialized.append(&mut output_bytes);
@@ -678,6 +692,14 @@ mod tests {
             Transaction::from_reader(&mut tx_reader, true).expect("Failed to parse the transaction");
 
         let script_pub_key = vec![
+                0x19,
+                0x0,
+                0x0,
+                0x0,
+                0x0,
+                0x0,
+                0x0,
+                0x0,
                 0x76,
                 0xa9,
                 0x14,
@@ -704,7 +726,9 @@ mod tests {
                 0x88,
                 0xac,
         ];
-        assert_eq!(&script_pub_key, tx.outputs[0].script_pub_key());
+        let mut buffer = vec![];
+        tx.outputs[0].script_pub_key().serialise(&mut buffer).expect("Failed to serialize");
+        assert_eq!(&script_pub_key, &buffer);
         assert_eq!(4000_0000, tx.outputs[1].amount());
     }
 

@@ -16,6 +16,9 @@ pub struct Script {
     // Processing stack of the `Script` programming language. After all the commands are evaluated,
     // the top element of the stack must be nonzero for the script to resolve as valid.
     cmds: Stack,
+    // Hold the size of the underlying data that makes this structure. This is mostly for
+    // convinience when we need a fast path for serialisation
+    size: usize,
 }
 
 impl Script {
@@ -84,7 +87,23 @@ impl Script {
 
         Ok(Self {
             cmds: Stack::from_vec(cmds),
+            size: script_len,
         })
+    }
+
+    /// Serialize the current object in the given `buffer`
+    pub fn serialise(&self, buffer: &mut Vec<u8>) -> Result<(), ScriptError> {
+        // Encode the length of the buffer
+        let len = Variant::from(u64::try_from(self.size)?);
+        buffer.extend_from_slice(&len.as_u64().to_le_bytes());
+        self.cmds.serialise(buffer)?;
+        Ok(())
+    }
+
+    pub fn to_vec(self) -> Result<Vec<u8>, ScriptError> {
+        let mut buffer = vec![];
+        self.serialise(&mut buffer)?;
+        Ok(buffer)
     }
 }
 
@@ -94,6 +113,7 @@ pub enum ScriptError {
     Variant(VariantError),
     Reader(ReaderError),
     TryFromInt(TryFromIntError),
+    Stack(StackError),
 }
 
 impl From<VariantError> for ScriptError {
@@ -111,6 +131,12 @@ impl From<ReaderError> for ScriptError {
 impl From<TryFromIntError> for ScriptError {
     fn from(err: TryFromIntError) -> Self {
         Self::TryFromInt(err)
+    }
+}
+
+impl From<StackError> for ScriptError {
+    fn from(err: StackError) -> Self {
+        Self::Stack(err)
     }
 }
 
@@ -149,6 +175,24 @@ impl Stack {
     pub fn pop(&mut self) -> Option<Command> {
         self.0.pop()
     }
+
+    pub fn serialise(&self, buffer: &mut Vec<u8>) -> Result<(), StackError> {
+        for cmd in self.0.iter() {
+            cmd.serialise(buffer)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum StackError {
+    Command(CommandError),
+}
+
+impl From<CommandError> for StackError {
+    fn from(err: CommandError) -> Self {
+        Self::Command(err)
+    }
 }
 
 /// Represents a command processed by the `Script` programming language
@@ -165,6 +209,32 @@ impl Command {
 
     pub fn from_op(opcode: Opcode) -> Self {
         Self::Opcode(opcode)
+    }
+
+    pub fn serialise(&self, buffer: &mut Vec<u8>) -> Result<(), CommandError> {
+        match self {
+            Self::Element(elem) => elem.serialise(buffer)?,
+            Self::Opcode(opcode) => buffer.push(opcode.as_u8()),
+        };
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum CommandError {
+    Element(ElementError),
+    Opcode(OpcodeError),
+}
+
+impl From<ElementError> for CommandError {
+    fn from(err: ElementError) -> Self {
+        Self::Element(err)
+    }
+}
+
+impl From<OpcodeError> for CommandError {
+    fn from(err: OpcodeError) -> Self {
+        Self::Opcode(err)
     }
 }
 
@@ -189,6 +259,39 @@ impl Element {
     pub fn from_slice(slice: &[u8]) -> Self {
         Self { data: slice.to_vec() }
     }
+
+    /// Serialise the current element into a slice of bytes
+    pub fn serialise(&self, buffer: &mut Vec<u8>) -> Result<(), ElementError> {
+        // Each element represents a sequence of data, which is encoded different based on size.
+        // First we get the length of the data
+        let len = self.data.len();
+
+        // If the data length is 0, something is wrong and this should not be encoded
+        if len == 0 {
+            return Err(ElementError::ZeroSizedElement);
+        } else if len <= opcode::OP_SPECIAL_END as usize {
+            // We encode the length as a single byte
+            buffer.push(len as u8);
+        } else if len > opcode::OP_SPECIAL_END as usize && len < 0x100 {
+            // We first need to push a special opcode specifying that we encode the length as a
+            // single byte
+            buffer.push(opcode::OP_PUSHDATA1);
+            // We encode the length as a single byte
+            buffer.push(len as u8);
+        } else if len >= 0x100 && len <= 520 {
+            // We first need to push a special opcode specifying that we encode the length as 2
+            // bytes
+            buffer.push(opcode::OP_PUSHDATA2);
+            // We encode the length as 2 bytes
+            buffer.extend_from_slice(&(len as u16).to_le_bytes());
+        } else {
+            return Err(ElementError::ElementTooLong(len));
+        }
+        // Encode the actual data
+        buffer.extend_from_slice(&self.data);
+        // Return successfully
+        Ok(())
+    }
 }
 
 impl AsRef<[u8]> for Element {
@@ -198,7 +301,10 @@ impl AsRef<[u8]> for Element {
 }
 
 #[derive(Debug)]
-pub enum ElementError {}
+pub enum ElementError {
+    ZeroSizedElement,
+    ElementTooLong(usize),
+}
 
 /// Opcodes process the data. They consume 0 or more elements from the processing stack and push
 /// zero or more elementes back to the stack.
@@ -208,9 +314,14 @@ pub enum Opcode {
     Dup,
     Hash256,
     Hash160,
+    EqualVerify,
+    CheckSig,
     // Specified a NO_OP operation
     Nop,
 }
+
+#[derive(Debug)]
+pub enum OpcodeError {}
 
 impl Opcode {
     /// Executes the current operation, by consuming it. A failed operation will return `false` and
@@ -225,6 +336,19 @@ impl Opcode {
             _ => false,
         }
     }
+
+    /// Return the Opcode value as encoded as a single `u8`
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            Self::Dup => opcode::OP_DUP,
+            Self::Hash160 => opcode::OP_HASH160,
+            Self::Hash256 => opcode::OP_HASH256,
+            Self::EqualVerify => opcode::OP_EQUALVERIFY,
+            Self::CheckSig => opcode::OP_CHECKSIG,
+            // If the operation is not yet supported, we just initialize a no op
+            Self::Nop => opcode::OP_NOP,
+        }
+    }
 }
 
 impl From<u8> for Opcode {
@@ -233,6 +357,8 @@ impl From<u8> for Opcode {
             opcode::OP_DUP => Self::Dup,
             opcode::OP_HASH160 => Self::Hash160,
             opcode::OP_HASH256 => Self::Hash256,
+            opcode::OP_EQUALVERIFY => Self::EqualVerify,
+            opcode::OP_CHECKSIG => Self::CheckSig,
             // If the operation is not yet supported, we just initialize a no op
             _ => Self::Nop,
         }
@@ -297,7 +423,7 @@ mod opcode {
     pub const OP_0: u8 = 0x00;
     pub const OP_FALSE: u8 = 0x00;
     // Between 0x01 and 0x4b the next opcode bytes is data to be pushed onto the stack. This means
-    // the when we encounter a value in this range, we 
+    // the when we encounter a value in this range, we read that many bytes
     pub const OP_SPECIAL_START: u8 = 0x01;
     pub const OP_SPECIAL_END: u8 = 0x4b;
     // The next byte contains the number of bytes to be pushed onto the stack. Since we already
@@ -313,12 +439,20 @@ mod opcode {
     // The number 1 is pushed onto the stack.
     pub const OP_1: u8 = 0x51;
     pub const OP_TRUE: u8 = 0x51;
+    // Opcode to specify a no op
+    pub const OP_NOP: u8 = 0x61;
     // Opcode duplicates the top element of the stack
     pub const OP_DUP: u8 = 0x76;
+    // Same as OP_EQUAL, but runs OP_VERIFY afterward.
+    pub const OP_EQUALVERIFY: u8 = 0x88;
 
     // Crypto functions
     pub const OP_HASH160: u8 = 0xa9;
     pub const OP_HASH256: u8 = 0xaa;
+    // The entire transaction's outputs, inputs, and script (from the most recently-executed 
+    // OP_CODESEPARATOR to the end) are hashed. The signature used by OP_CHECKSIG must be a valid
+    // signature for this hash and public key. If it is, 1 is returned, 0 otherwise.
+    pub const OP_CHECKSIG: u8 = 0xac;
 }
 
 #[cfg(test)]
