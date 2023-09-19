@@ -95,7 +95,7 @@ impl Script {
     pub fn serialise(&self, buffer: &mut Vec<u8>) -> Result<(), ScriptError> {
         // Encode the length of the buffer
         let len = Variant::from(u64::try_from(self.size)?);
-        buffer.extend_from_slice(&len.as_u64().to_le_bytes());
+        buffer.extend_from_slice(&len.encode());
         self.cmds.serialise(buffer)?;
         Ok(())
     }
@@ -360,7 +360,9 @@ impl From<u8> for Opcode {
             opcode::OP_EQUALVERIFY => Self::EqualVerify,
             opcode::OP_CHECKSIG => Self::CheckSig,
             // If the operation is not yet supported, we just initialize a no op
-            _ => Self::Nop,
+            _ => {
+                Self::Nop
+            }
         }
     }
 }

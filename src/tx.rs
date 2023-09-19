@@ -14,7 +14,7 @@ pub trait TxInput: Sized {
     // Provides the ability to parse the current object from a `Reader`
     fn parse(reader: &mut Reader) -> Result<Self, Self::Error>;
     // Serialises `Self` into a structure of bytes, represented by `Vec<u8>`
-    fn as_vec(&self) -> Result<Vec<u8>, Self::Error>;
+    fn to_vec(self) -> Result<Vec<u8>, Self::Error>;
     // Return the amount of this input, by referring to the previous transaction
     fn amount<O: TxOutput>(&self, tx_fetcher: &mut TxFetcher<Self, O>, testnet: bool) -> Result<u64, Self::Error>;
 }
@@ -37,7 +37,7 @@ pub struct Version {
 
 impl Version {
     pub fn parse(reader: &mut Reader) -> Result<Self, VersionError> {
-        let major = reader.read::<u32, BigEndian>()?;
+        let major = reader.read::<u32, LittleEndian>()?;
 
         Ok(Self { major })
     }
@@ -71,7 +71,7 @@ pub struct Input {
     // Script signature. Opening a locked box-something that can only be done by the owner of the
     // transaction output. This is a variable length field. Represents the key used to open the
     // locking script from the `Output`'s script pub key
-    script_sig: Vec<u8>,
+    script_sig: Script,
     // Sequence, originally intended as a way to do what Satoshi called "high-frequency trades"
     // with the locktime field, but is currently used with Replace-By-Fee(RBF) and
     // OP_CHECKSEQUENCEVERIFY.
@@ -84,6 +84,7 @@ pub enum InputError {
     Variant(VariantError),
     TryFromInt(TryFromIntError),
     TxFetch(TxFetchError),
+    Script(ScriptError),
 }
 
 impl From<ReaderError> for InputError {
@@ -110,6 +111,12 @@ impl From<TxFetchError> for InputError {
     }
 }
 
+impl From<ScriptError> for InputError {
+    fn from(err: ScriptError) -> Self {
+        Self::Script(err)
+    }
+}
+
 impl TxInput for Input {
     type Error = InputError;
     fn parse(reader: &mut Reader) -> Result<Self, Self::Error> {
@@ -117,10 +124,8 @@ impl TxInput for Input {
         let prev_tx_id = U256::from_little_endian(reader.read_bytes(32)?);
         // Read the previous transaction Index
         let prev_tx_idx = reader.read::<u32, LittleEndian>()?;
-        // Read the variant that tells us how long the script is
-        let script_len = usize::try_from(Variant::parse(reader)?.as_u64())?;
         // Read the script signature
-        let script_sig = reader.read_bytes(script_len)?.to_vec();
+        let script_sig = Script::parse(reader)?;
         // Sequence
         let seq = reader.read::<u32, LittleEndian>()?;
 
@@ -143,31 +148,27 @@ impl TxInput for Input {
         Ok(amount)
     }
 
-    fn as_vec(&self) -> Result<Vec<u8>, Self::Error> {
-        // Convert the script signature length to a `u64` so we can encode it as a Variant
-        let script_len = u64::try_from(self.script_sig.len())?;
-        // Compute the variant encoding of the length of the `script_sig` field
-        let mut script_sig_variant = Variant::from(script_len).encode();
-
+    fn to_vec(self) -> Result<Vec<u8>, Self::Error> {
+        let mut script_sig = self.script_sig.to_vec()?;
         // Compute the total size we need to allocate for our `Vec`
         let alloc_size = core::mem::size_of::<U256>() + core::mem::size_of::<u32>() +
-            script_sig_variant.len() + self.script_sig.len() + core::mem::size_of::<u32>();
+            script_sig.len() + core::mem::size_of::<u32>();
 
         // Allocate the Vec
         let mut serialized = Vec::with_capacity(alloc_size);
 
         // Resize and add the previous transaction id
         serialized.resize(core::mem::size_of::<U256>(), 0);
+
+        // Serialise the previous transaction Id
         self.prev_tx_id.to_little_endian(&mut serialized[0..core::mem::size_of::<U256>()]);
 
         // Convert the previous transaction index into a `Vec`
         let mut prev_tx_idx_bytes = self.prev_tx_idx.to_le_bytes().to_vec();
         // Append it to the serialized vector
         serialized.append(&mut prev_tx_idx_bytes);
-        // Append the variant
-        serialized.append(&mut script_sig_variant);
         // Append the script signature bytes
-        serialized.extend_from_slice(&self.script_sig);
+        serialized.append(&mut script_sig);
 
         // Convert the sequence field to bytes
         let mut seq_bytes = self.seq.to_le_bytes().to_vec();
@@ -179,7 +180,7 @@ impl TxInput for Input {
 }
 
 impl Input {
-    pub fn script_sig(&self) -> &[u8] {
+    pub fn script_sig(&self) -> &Script {
         &self.script_sig
     }
 }
@@ -231,8 +232,6 @@ impl TxOutput for Output {
 
         // Concatenate the bytes of the amount field
         serialized.append(&mut amount_bytes);
-        // Concatenate the length of the variant
-        serialized.append(&mut script_pub_key_variant);
         // Concatenate the script pub key
         serialized.append(&mut script_pub_key);
 
@@ -439,7 +438,7 @@ impl<I: TxInput, O: TxOutput> Transaction<I, O> {
         for input in self.inputs.into_iter() {
             // Encode the inputs as a vector of bytes
             let mut input_bytes = input
-                .as_vec()
+                .to_vec()
                 .map_err(|e| TxError::InputError(format!("{e:?}")))?;
             // Append it to the serialized vector
             serialized.append(&mut input_bytes);
@@ -693,13 +692,6 @@ mod tests {
 
         let script_pub_key = vec![
                 0x19,
-                0x0,
-                0x0,
-                0x0,
-                0x0,
-                0x0,
-                0x0,
-                0x0,
                 0x76,
                 0xa9,
                 0x14,
@@ -741,6 +733,20 @@ mod tests {
 
         let mut tx_fetcher: TxFetcher<Input, Output> = TxFetcher::new();
         tx_fetcher.fetch(tx_id, true, true).expect("Failed to fetch transaction");
+    }
+
+    #[test]
+    fn test_tx_serialise() {
+        let test_file = "testdata/transaction_ex5_pg58.bin";
+        let tx_bytes = std::fs::read(test_file).expect("Failed to read test file");
+        let mut tx_reader = Reader::from_vec(tx_bytes.clone());
+
+        let tx: Transaction<Input, Output> =
+            Transaction::from_reader(&mut tx_reader, true).expect("Failed to parse the transaction");
+
+        let encoded_tx = tx.encode().expect("Failed to deserialize");
+
+        assert_eq!(tx_bytes, encoded_tx);
     }
 
     #[test]
