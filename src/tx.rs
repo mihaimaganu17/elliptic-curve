@@ -4,7 +4,7 @@ use primitive_types::U256;
 use crate::hashing;
 use crate::script::{Script, ScriptError};
 use crate::utils::{decode_hex, Variant, VariantError};
-use crate::io::{Reader, ReaderError, BigEndian, LittleEndian};
+use crate::io::{Reader, ReaderError, LittleEndian};
 use std::collections::HashMap;
 use serde::Deserialize;
 
@@ -16,7 +16,11 @@ pub trait TxInput: Sized {
     // Serialises `Self` into a structure of bytes, represented by `Vec<u8>`
     fn to_vec(self) -> Result<Vec<u8>, Self::Error>;
     // Return the amount of this input, by referring to the previous transaction
-    fn amount<O: TxOutput>(&self, tx_fetcher: &mut TxFetcher<Self, O>, testnet: bool) -> Result<u64, Self::Error>;
+    fn amount<O: TxOutput>(
+        &self,
+        tx_fetcher: &mut TxFetcher<Self, O>,
+        testnet: bool,
+    ) -> Result<u64, Self::Error>;
 }
 /// Must be implemented by any type that has to be a transaction output
 pub trait TxOutput: Sized {

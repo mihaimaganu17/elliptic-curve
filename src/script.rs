@@ -1,3 +1,4 @@
+use core::ops::Add;
 use std::{
     num::TryFromIntError,
     convert::AsRef,
@@ -22,6 +23,11 @@ pub struct Script {
 }
 
 impl Script {
+    pub fn from_vec(vec: Vec<u8>) -> Result<Self, ScriptError> {
+        let mut reader = Reader::from_vec(vec);
+        Self::parse(&mut reader)
+    }
+
     /// Parses the script from a reader
     pub fn parse(reader: &mut Reader) -> Result<Self, ScriptError> {
         // Read the length of the entire script
@@ -105,6 +111,22 @@ impl Script {
         self.serialise(&mut buffer)?;
         Ok(buffer)
     }
+
+    /// Return the 2 parts of the object as a `Stack` and the size
+    pub fn into_parts(self) -> (Stack, usize){
+        (self.cmds, self.size)
+    }
+}
+
+impl Add<Self> for Script {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self::Output {
+        let (left_stack, left_size) = self.into_parts();
+        let (right_stack, right_size) = rhs.into_parts();
+        let cmds = left_stack + right_stack;
+        let size = left_size + right_size;
+        Self { cmds, size }
+    }
 }
 
 #[derive(Debug)]
@@ -181,6 +203,19 @@ impl Stack {
             cmd.serialise(buffer)?;
         }
         Ok(())
+    }
+
+    pub fn into_inner(self) -> Vec<Command> {
+        self.0
+    }
+}
+
+impl Add<Self> for Stack {
+    type Output = Stack;
+    fn add(self, rhs: Self) -> Self::Output {
+        let mut base_vec = self.into_inner();
+        base_vec.append(&mut rhs.into_inner());
+        Stack::from_vec(base_vec)
     }
 }
 
