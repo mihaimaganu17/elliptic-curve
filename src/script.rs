@@ -368,23 +368,41 @@ impl Element {
         self.data.len() == 0
     }
 
-    /// Encode a numerical value as an element to be pushed on the stack
-    pub fn from_integer<I: Integer>(value: I) -> Self {
-        Self { data: vec![] }
+    /// Encode a numerical value as an element to be pushed on the stack. Currently there seems no
+    /// need to encode something other than a singned 64-bit integer.
+    pub fn from_integer(value: i64) -> Self {
+        if value == 0 {
+            return Self { data: vec![] };
+        }
+        // Get the absolute value of the value
+        let mut abs_value = value.abs();
+        // Instantiate a buffer
+        let mut buffer = vec![];
+        // Store if our value is negative
+        let is_negative = value < 0;
+        // Loop until we have a non-zero value
+        while abs_value != 0 {
+            buffer.push((abs_value & 0xff) as u8);
+            abs_value >>= 8;
+        }
+        // Temporary reference to buffers length
+        let len = buffer.len();
+        // We already know at this point that the value is not zero, so this means we have an
+        // element in the buffer. And we want to check if the first element is our marker for a
+        // negative value
+        if buffer[len - 1] & 0x80 != 0 {
+            if is_negative {
+                buffer.push(0x80);
+            } else {
+                buffer.push(0);
+            }
+        } else if is_negative {
+            buffer[len - 1] |= 0x80;
+        }
+
+        Self { data: buffer }
     }
 }
-
-pub trait Integer {}
-impl Integer for u8 {}
-impl Integer for u16 {}
-impl Integer for u32 {}
-impl Integer for u64 {}
-impl Integer for u128 {}
-impl Integer for i8 {}
-impl Integer for i16 {}
-impl Integer for i32 {}
-impl Integer for i64 {}
-impl Integer for i128 {}
 
 impl AsRef<[u8]> for Element {
     fn as_ref(&self) -> &[u8] {
@@ -421,6 +439,6 @@ mod tests {
     fn test_numeric_to_element() {
         let value = -128942432;
         let elem = Element::from_integer(value);
-        println!("Element {:x?}", elem);
+        assert!(elem == Element { data: [0x60, 0x81, 0xaf, 0x87].to_vec() } )
     }
 }
