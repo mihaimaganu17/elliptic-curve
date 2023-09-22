@@ -1,3 +1,5 @@
+mod op;
+
 use core::ops::Add;
 use std::{
     num::TryFromIntError,
@@ -7,6 +9,7 @@ use crate::{
     io::{LittleEndian, Reader, ReaderError},
     utils::{Variant, VariantError},
 };
+use op::{Opcode, opcode, OpcodeError};
 
 /// Stack-based programming language which defines how bitcoins are spent. It processes one command
 /// at a time. The commands operate on a stack of elements. This struct can parse both the
@@ -16,7 +19,7 @@ pub struct Script {
     // The commands that operate on the stack.
     // Processing stack of the `Script` programming language. After all the commands are evaluated,
     // the top element of the stack must be nonzero for the script to resolve as valid.
-    cmds: Stack,
+    cmds: Vec<Command>,
     // Hold the size of the underlying data that makes this structure. This is mostly for
     // convinience when we need a fast path for serialisation
     size: usize,
@@ -92,7 +95,7 @@ impl Script {
         }
 
         Ok(Self {
-            cmds: Stack::from_vec(cmds),
+            cmds: cmds,
             size: script_len,
         })
     }
@@ -102,7 +105,9 @@ impl Script {
         // Encode the length of the buffer
         let len = Variant::from(u64::try_from(self.size)?);
         buffer.extend_from_slice(&len.encode());
-        self.cmds.serialise(buffer)?;
+        for cmd in self.cmds.iter() {
+            cmd.serialise(buffer)?;
+        }
         Ok(())
     }
 
@@ -113,19 +118,50 @@ impl Script {
     }
 
     /// Return the 2 parts of the object as a `Stack` and the size
-    pub fn into_parts(self) -> (Stack, usize){
+    pub fn into_parts(self) -> (Vec<Command>, usize){
         (self.cmds, self.size)
+    }
+
+    /// Evaluates the contents of the script, consuming them and using the given `stack`,
+    /// returning the last element of the stack
+    pub fn evaluate(&self, stack: &mut Stack) -> Result<bool, ScriptError> {
+        // Go through each command for the current script
+        for cmd in self.cmds.iter() {
+            let executed = match cmd {
+                Command::Opcode(opcode) => opcode.execute(stack),
+                Command::Element(elem) => {
+                    stack.push(elem.clone());
+                    true
+                }
+            };
+            if executed == false {
+                return Ok(executed);
+            }
+        }
+        // By the end of the script evaluation, if there is no element on the stack, return false
+        if stack.len() == 0 {
+            return Ok(false);
+        }
+        // Since we are here, there is definetly an element on the stack
+        if let Some(elem) = stack.top() {
+            // If that element is empty
+            if elem.is_empty() {
+                // Return false
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
 impl Add<Self> for Script {
     type Output = Self;
     fn add(self, rhs: Self) -> Self::Output {
-        let (left_stack, left_size) = self.into_parts();
-        let (right_stack, right_size) = rhs.into_parts();
-        let cmds = left_stack + right_stack;
+        let (mut left_cmds, left_size) = self.into_parts();
+        let (mut right_cmds, right_size) = rhs.into_parts();
+        left_cmds.append(&mut right_cmds);
         let size = left_size + right_size;
-        Self { cmds, size }
+        Self { cmds: left_cmds, size }
     }
 }
 
@@ -133,6 +169,7 @@ impl Add<Self> for Script {
 pub enum ScriptError {
     ParsingScriptFailed,
     Variant(VariantError),
+    Command(CommandError),
     Reader(ReaderError),
     TryFromInt(TryFromIntError),
     Stack(StackError),
@@ -141,6 +178,12 @@ pub enum ScriptError {
 impl From<VariantError> for ScriptError {
     fn from(err: VariantError) -> Self {
         Self::Variant(err)
+    }
+}
+
+impl From<CommandError> for ScriptError {
+    fn from(err: CommandError) -> Self {
+        Self::Command(err)
     }
 }
 
@@ -165,7 +208,7 @@ impl From<StackError> for ScriptError {
 /// Represent the processing stack for the `Script` programming language. It is essentially a
 /// wrapper againg a sequence of elements.
 #[derive(Debug)]
-pub struct Stack(Vec<Command>);
+pub struct Stack(Vec<Element>);
 
 impl Stack {
     /// Create a new empty stack
@@ -174,7 +217,7 @@ impl Stack {
     }
 
     /// Create a new stack from an existing vector of elements
-    pub fn from_vec(vec: Vec<Command>) -> Stack {
+    pub fn from_vec(vec: Vec<Element>) -> Stack {
         Self(vec)
     }
 
@@ -184,28 +227,21 @@ impl Stack {
     }
 
     /// Push an element to the top of the stack
-    pub fn push(&mut self, cmd: Command) {
-        self.0.push(cmd);
+    pub fn push(&mut self, elem: Element) {
+        self.0.push(elem);
     }
 
     /// Bit-wise copies and returns the top element of the stack or `None` if the stack is empty
-    pub fn top(&self) -> Option<Command> {
+    pub fn top(&self) -> Option<Element> {
         self.0.get(self.0.len() - 1).cloned()
     }
 
     /// Pop the element from the top of the stack
-    pub fn pop(&mut self) -> Option<Command> {
+    pub fn pop(&mut self) -> Option<Element> {
         self.0.pop()
     }
 
-    pub fn serialise(&self, buffer: &mut Vec<u8>) -> Result<(), StackError> {
-        for cmd in self.0.iter() {
-            cmd.serialise(buffer)?;
-        }
-        Ok(())
-    }
-
-    pub fn into_inner(self) -> Vec<Command> {
+    pub fn into_inner(self) -> Vec<Element> {
         self.0
     }
 }
@@ -221,12 +257,12 @@ impl Add<Self> for Stack {
 
 #[derive(Debug)]
 pub enum StackError {
-    Command(CommandError),
+    Element(ElementError),
 }
 
-impl From<CommandError> for StackError {
-    fn from(err: CommandError) -> Self {
-        Self::Command(err)
+impl From<ElementError> for StackError {
+    fn from(err: ElementError) -> Self {
+        Self::Element(err)
     }
 }
 
@@ -275,10 +311,9 @@ impl From<OpcodeError> for CommandError {
 
 pub const MAX_ELEMENT_SIZE: usize = 520;
 
-/// Element represents data. Technically, processing an element pushed that element onto the stack
-/// Elements are byte strings of lenght 1 to 520. A typical element might be a DER signature or a
-/// SEC pubkey.
-/// Element is backed by an array since the data has to be copied in some instances.
+/// Element represents data. Technically, processing an element is equivalent to pushing that
+/// element onto the stack. Elements are byte strings of lenght 1 to 520. A typical element might
+/// be a DER signature or a SEC pubkey.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Element {
     data: Vec<u8>,
@@ -327,7 +362,29 @@ impl Element {
         // Return successfully
         Ok(())
     }
+
+    /// Check if the underlying data is empty
+    pub fn is_empty(&self) -> bool {
+        self.data.len() == 0
+    }
+
+    /// Encode a numerical value as an element to be pushed on the stack
+    pub fn from_integer<I: Integer>(value: I) -> Self {
+        Self { data: vec![] }
+    }
 }
+
+pub trait Integer {}
+impl Integer for u8 {}
+impl Integer for u16 {}
+impl Integer for u32 {}
+impl Integer for u64 {}
+impl Integer for u128 {}
+impl Integer for i8 {}
+impl Integer for i16 {}
+impl Integer for i32 {}
+impl Integer for i64 {}
+impl Integer for i128 {}
 
 impl AsRef<[u8]> for Element {
     fn as_ref(&self) -> &[u8] {
@@ -341,166 +398,16 @@ pub enum ElementError {
     ElementTooLong(usize),
 }
 
-/// Opcodes process the data. They consume 0 or more elements from the processing stack and push
-/// zero or more elementes back to the stack.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Opcode {
-    // Specifies the OP_DUP operation, which duplicates the top element of the stack
-    Dup,
-    Hash256,
-    Hash160,
-    EqualVerify,
-    CheckSig,
-    // Specified a NO_OP operation
-    Nop,
-}
-
-#[derive(Debug)]
-pub enum OpcodeError {}
-
-impl Opcode {
-    /// Executes the current operation, by consuming it. A failed operation will return `false` and
-    /// it will automatically fail script evaluation.
-    pub fn execute(self, stack: &mut Stack) -> bool {
-        match self {
-            Self::Dup => op_dup(stack),
-            Self::Hash160=> op_hash160(stack),
-            Self::Hash256=> op_hash256(stack),
-            // If the operation is not yet supported, we just return `false` as a mean to tell that
-            // the operation failed
-            _ => false,
-        }
-    }
-
-    /// Return the Opcode value as encoded as a single `u8`
-    pub fn as_u8(&self) -> u8 {
-        match self {
-            Self::Dup => opcode::OP_DUP,
-            Self::Hash160 => opcode::OP_HASH160,
-            Self::Hash256 => opcode::OP_HASH256,
-            Self::EqualVerify => opcode::OP_EQUALVERIFY,
-            Self::CheckSig => opcode::OP_CHECKSIG,
-            // If the operation is not yet supported, we just initialize a no op
-            Self::Nop => opcode::OP_NOP,
-        }
-    }
-}
-
-impl From<u8> for Opcode {
-    fn from(value: u8) -> Self {
-        match value {
-            opcode::OP_DUP => Self::Dup,
-            opcode::OP_HASH160 => Self::Hash160,
-            opcode::OP_HASH256 => Self::Hash256,
-            opcode::OP_EQUALVERIFY => Self::EqualVerify,
-            opcode::OP_CHECKSIG => Self::CheckSig,
-            // If the operation is not yet supported, we just initialize a no op
-            _ => {
-                Self::Nop
-            }
-        }
-    }
-}
-
-/// Implements duplication of the top element of the stack
-pub fn op_dup(stack: &mut Stack) -> bool {
-    if stack.len() < 1 {
-        false
-    } else {
-        let maybe_elem = stack.top();
-        if let Some(elem) = maybe_elem {
-            stack.push(elem);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-/// Implements a double round of sha256 over the top element of the stack and pushed the result
-/// onto the stack
-pub fn op_hash256(stack: &mut Stack) -> bool {
-    if stack.len() < 1 {
-        false
-    } else {
-        let maybe_elem = stack.pop();
-        if let Some(Command::Element(elem)) = maybe_elem {
-            let hashed_vec = crate::hashing::double_sha256(elem.as_ref());
-            let hashed_elem_cmd = Command::from_elem(Element::from_vec(hashed_vec));
-            stack.push(hashed_elem_cmd);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-/// Implements the sha256 followed by ripemd160 hashing over the first element of the stack and
-/// pushes the result to the stack
-pub fn op_hash160(stack: &mut Stack) -> bool {
-    if stack.len() < 1 {
-        false
-    } else {
-        let maybe_elem = stack.pop();
-        if let Some(Command::Element(elem)) = maybe_elem {
-            let hashed_vec = crate::hashing::hash160(elem.as_ref());
-            let hashed_elem = Command::from_elem(Element::from_vec(hashed_vec));
-            stack.push(hashed_elem);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-// List of opcodes provided as constants that indicate what operation to perform
-mod opcode {
-    // An empty array of bytes is pushed onto the stack. This is not a no-op; an item is added to
-    // the stack.
-    pub const OP_0: u8 = 0x00;
-    pub const OP_FALSE: u8 = 0x00;
-    // Between 0x01 and 0x4b the next opcode bytes is data to be pushed onto the stack. This means
-    // the when we encounter a value in this range, we read that many bytes
-    pub const OP_SPECIAL_START: u8 = 0x01;
-    pub const OP_SPECIAL_END: u8 = 0x4b;
-    // The next byte contains the number of bytes to be pushed onto the stack. Since we already
-    // have the special range above, this applies to element lengths between 76 and 255 bytes.
-    pub const OP_PUSHDATA1: u8 = 0x4c;
-    // The next 2 bytes contain the number of bytes to be pushed onto the stack. This is for
-    // anything between 256 and 520 byte inclusive.
-    pub const OP_PUSHDATA2: u8 = 0x4d;
-    // The next 4 bytes contain the number of bytes to be pushed onto the stack.
-    pub const OP_PUSHDATA4: u8 = 0x4e;
-    // The number -1 is pushed onto the stack.
-    pub const OP_1NEGATE: u8 = 0x4f;
-    // The number 1 is pushed onto the stack.
-    pub const OP_1: u8 = 0x51;
-    pub const OP_TRUE: u8 = 0x51;
-    // Opcode to specify a no op
-    pub const OP_NOP: u8 = 0x61;
-    // Opcode duplicates the top element of the stack
-    pub const OP_DUP: u8 = 0x76;
-    // Same as OP_EQUAL, but runs OP_VERIFY afterward.
-    pub const OP_EQUALVERIFY: u8 = 0x88;
-
-    // Crypto functions
-    pub const OP_HASH160: u8 = 0xa9;
-    pub const OP_HASH256: u8 = 0xaa;
-    // The entire transaction's outputs, inputs, and script (from the most recently-executed 
-    // OP_CODESEPARATOR to the end) are hashed. The signature used by OP_CHECKSIG must be a valid
-    // signature for this hash and public key. If it is, 1 is returned, 0 otherwise.
-    pub const OP_CHECKSIG: u8 = 0xac;
-}
 
 #[cfg(test)]
 mod tests {
-    use crate::script::{Command, Element, Stack, op_dup};
+    use crate::script::{Command, Element, Stack, op::op_dup};
 
     #[test]
     fn test_op_dup() {
         let mut stack = Stack::new();
-        let elem1 = Command::from_elem(Element::from_vec(vec![1, 2, 3, 4]));
-        let elem2 = Command::from_elem(Element::from_vec(vec![5, 6, 7, 8]));
+        let elem1 = Element::from_vec(vec![1, 2, 3, 4]);
+        let elem2 = Element::from_vec(vec![5, 6, 7, 8]);
         stack.push(elem1);
         stack.push(elem2.clone());
         assert!(op_dup(&mut stack) == true);
@@ -508,5 +415,12 @@ mod tests {
         for _idx in 0..2 {
             assert!(stack.pop().unwrap() == elem2);
         }
+    }
+
+    #[test]
+    fn test_numeric_to_element() {
+        let value = -128942432;
+        let elem = Element::from_integer(value);
+        println!("Element {:x?}", elem);
     }
 }
